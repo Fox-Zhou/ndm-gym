@@ -13,11 +13,11 @@ from ..robots.g1 import NUM_J
 class TrackingPolicy(nn.Module):
     """a = dec(enc(g), o_{t-9:t}); deterministic, latent z in R^32 bounded by tanh."""
 
-    def __init__(self, obs_dim: int, goal_dim: int, hist: int = 10, z_dim: int = 32):
+    def __init__(self, obs_dim: int, goal_dim: int, hist: int = 10, z_dim: int = 32, action_dim: int = NUM_J):
         super().__init__()
         self.hist = hist
         self.enc = mlp(goal_dim, [2048, 1024, 512, 256], z_dim)
-        self.dec = mlp(z_dim + obs_dim * hist, [2048, 1024, 512, 256], NUM_J)
+        self.dec = mlp(z_dim + obs_dim * hist, [2048, 1024, 512, 256], action_dim)
         with torch.no_grad():
             self.dec[-1].weight.mul_(0.01)
             self.dec[-1].bias.zero_()

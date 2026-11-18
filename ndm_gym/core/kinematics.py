@@ -62,7 +62,7 @@ class ArticulationKinematics:
         self.device, self.mjcf_path = device, mjcf_path
         jname_to_idx = {n: i for i, n in enumerate(joint_names)}
         # moving bodies in tree order (mujoco orders parents before children)
-        bodies, parent, joint_idx, axes, offs_p, offs_R = [], [], [], [], [], []
+        bodies, parent, joint_idx, joint_indices, axes, joint_axes, offs_p, offs_R = [], [], [], [], [], [], [], []
         mj_to_local = {}
         for b in range(1, m.nbody):
             name = m.body(b).name
@@ -74,19 +74,34 @@ class ArticulationKinematics:
             if m.jnt_type[jid] == mujoco.mjtJoint.mjJNT_FREE:
                 parent.append(-1)
                 joint_idx.append(-1)
+                joint_indices.append(())
+                joint_axes.append(())
             else:
                 pb = m.body_parentid[b]
                 while pb not in mj_to_local:  # skip fixed parents
                     raise RuntimeError(f"fixed parent for {name}")
                 parent.append(mj_to_local[pb])
-                joint_idx.append(jname_to_idx[m.joint(jid).name])
+                jids = list(range(m.body_jntadr[b], m.body_jntadr[b] + m.body_jntnum[b]))
+                if any(m.jnt_type[j] != mujoco.mjtJoint.mjJNT_HINGE for j in jids):
+                    raise ValueError(f"body {name}: moving non-root bodies require hinge joints")
+                indices = tuple(jname_to_idx[m.joint(j).name] for j in jids)
+                body_axes = tuple(m.jnt_axis[j].copy() for j in jids)
+                joint_idx.append(indices[0])  # legacy one-hinge consumers
+                joint_indices.append(indices)
+                joint_axes.append(body_axes)
             axes.append(m.jnt_axis[jid].copy())
             offs_p.append(m.body_pos[b].copy())
             offs_R.append(m.body_quat[b].copy())
         self.body_names = bodies
         self.parent = parent
         self.joint_idx = joint_idx
+        self.joint_indices = joint_indices
         self.axes = torch.tensor(np.array(axes), dtype=torch.float32, device=device)
+        self.joint_axes = tuple(
+            tuple(torch.tensor(axis, dtype=torch.float32, device=device) for axis in body_axes)
+            for body_axes in joint_axes
+        )
+        self.has_multi_hinge_bodies = any(len(indices) > 1 for indices in joint_indices)
         self.off_p = torch.tensor(np.array(offs_p), dtype=torch.float32, device=device)
         self.off_R = quat_to_mat(torch.tensor(np.array(offs_R), dtype=torch.float32, device=device))
         self.tracked_idx = [bodies.index(n) for n in tracked]
@@ -173,13 +188,17 @@ class ArticulationKinematics:
             if par < 0:
                 P[i], Rs[i], V[i], W[i] = p, R, v, w
                 continue
-            j = self.joint_idx[i]
             Rp = Rs[par]
             pi = P[par] + mat_vec(Rp, self.off_p[i])
-            R_off = mat_mat(Rp, self.off_R[i])
-            Ri = mat_mat(R_off, axis_angle_to_mat(self.axes[i], q[..., j]))
-            axis_w = mat_vec(R_off, self.axes[i])
-            wi = W[par] + axis_w * qd[..., j : j + 1]
+            Ri = mat_mat(Rp, self.off_R[i])
+            wi = W[par]
+            # A MuJoCo body may contain a serial stack of co-located hinges.
+            # Each later axis rotates with the hinges before it.  The old G1
+            # path has exactly one entry and is numerically unchanged.
+            for j, axis in zip(self.joint_indices[i], self.joint_axes[i]):
+                axis_w = mat_vec(Ri, axis)
+                wi = wi + axis_w * qd[..., j : j + 1]
+                Ri = mat_mat(Ri, axis_angle_to_mat(axis, q[..., j]))
             vi = V[par] + torch.cross(W[par], pi - P[par], dim=-1)
             P[i], Rs[i], V[i], W[i] = pi, Ri, vi, wi
         idx = range(self.num_bodies) if all_bodies else self.tracked_idx
