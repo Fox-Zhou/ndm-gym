@@ -28,7 +28,12 @@ PROFILE = bool(int(os.environ.get("SM_PROFILE", "0")))
 class SuperMimic(Algo):
     def __init__(self, args, kin, motion, mdp, dev):
         super().__init__(args, kin, motion, mdp, dev)
-        self.critic = Critic(INV_DIM + CRITIC_EXTRA + 73 * self.K).to(dev)
+        critic_feature_dim = getattr(
+            mdp, "critic_feature_dim", INV_DIM + CRITIC_EXTRA
+        )
+        self.critic = Critic(
+            critic_feature_dim + self.goal_frame_dim * self.K
+        ).to(dev)
         # optional (train.py --critic_cudagraphs): the critic's minibatch step as a CUDA graph, with Adam's capturable
         # implementation (its step count and learning rate on the device; not bitwise equal to the default one)
         self.critic_graphs = getattr(args, "critic_cudagraphs", False)
@@ -43,16 +48,37 @@ class SuperMimic(Algo):
         # (SuperTrack's) instead of setpoints about the default pose
         self.residual = self.is_residual(vars(args))
         if self.residual:
-            self.alpha = torch.tensor([action_scale(n) for n in G1_JOINT_NAMES], device=dev)
+            if hasattr(mdp, "action_scale"):
+                self.alpha = mdp.action_scale.to(dev)
+            elif self.action_dim == NUM_J:
+                self.alpha = torch.tensor(
+                    [action_scale(n) for n in G1_JOINT_NAMES], device=dev
+                )
+            else:
+                raise ValueError(
+                    "residual actions need character-specific action_scale"
+                )
             self.ref_u = reference_setpoints(motion, mdp.default_q, self.alpha)
         # per-component floors on the error normalization (pos, rot, lin vel, ang vel, q, qd increments)
-        self.err_floor = torch.cat((torch.full((3,), 3e-3), torch.full((3,), 5e-3), torch.full((3,), 2e-2), torch.full((3,), 5e-2),
-                                    torch.full((29,), 3e-3), torch.full((29,), 5e-2))).to(dev)  # fmt: skip
+        self.err_floor = torch.cat(
+            (
+                torch.full((3,), 3e-3),
+                torch.full((3,), 5e-3),
+                torch.full((3,), 2e-2),
+                torch.full((3,), 5e-2),
+                torch.full((self.action_dim,), 3e-3),
+                torch.full((self.action_dim,), 5e-2),
+            )
+        ).to(dev)
         # optional (--contact_reward w, InstantTrack; --ref_contact_fix, BlinkMimic): a foot-contact term in the imagined
         # reward only (tasks/contact.py); the simulator's reward, which the evaluation uses, is unchanged
         self.contact_w = getattr(args, "contact_reward", 0.0)
         if self.contact_w > 0:
-            self.feet = foot_bodies()
+            self.feet = (
+                mdp.foot_body_indices
+                if hasattr(mdp, "foot_body_indices")
+                else foot_bodies()
+            )
             self.ref_contact = reference_contact(motion, self.feet, calibrated=args.ref_contact_fix)
         self.wm_err = torch.compile(self._wm_err, **self.wm_compile)
         self.imag_step = torch.compile(self._imag_step, **self.pi_compile)
@@ -103,7 +129,7 @@ class SuperMimic(Algo):
     def _wm_err(self, S_hat, s1, mask):
         norm = self.wm.inc_norm if getattr(self.wm, "structured", False) else self.wm.out_norm  # --wm_structured: the increments' scale
         std = torch.maximum(norm.std(), self.err_floor)
-        e = (self.wm.state_error(S_hat, unflatten_state(s1)) / std) ** 2  # (B, k, D)
+        e = (self.wm.state_error(S_hat, self.unflatten_state(s1)) / std) ** 2  # (B, k, D)
         e = e.mean(-1)
         return (e * mask).sum() / s1.shape[0], e[:, -1], (e * mask).sum(1)
 
@@ -215,9 +241,9 @@ class SuperMimic(Algo):
             torch.cuda.synchronize()
             tq0 = time.time()
         s, h = self.sample_valid_starts(buffer, args.pi_batch)
-        S = unflatten_state(s["s"])
+        S = self.unflatten_state(s["s"])
         xi, f, a_prev = s["xi"], s["f"], s["a_prev"]
-        xi_n = normalize_xi(xi)
+        xi_n = self.normalize_context(xi)
         o_hist = self.start_obs_history(h)
         S = self.perturb_start(S)
         set_requires_grad(self.wm, False)
@@ -236,7 +262,7 @@ class SuperMimic(Algo):
             for t in range(HZ):
                 Aps.append(a_prev)
                 if self.pi_rollout_clip > 0:  # the step's policy inputs and a zero tensor added to its output (clip_rollout_policy_grads)
-                    taps.append((o_hist, g, torch.zeros(B, NUM_J, device=dev, requires_grad=True)))
+                    taps.append((o_hist, g, torch.zeros(B, self.action_dim, device=dev, requires_grad=True)))
                     S, a_prev, o_hist, f, g = self.imag_step(S, o_hist, a_prev, f, xi, xi_n, g, taps[-1][2])
                 else:
                     S, a_prev, o_hist, f, g = self.imag_step(S, o_hist, a_prev, f, xi, xi_n, g)
@@ -328,9 +354,9 @@ class SuperMimic(Algo):
         on the host). Returns (policy loss, value loss, imagined reward, gradient norm, imagined survival)."""
         args, dev, HZ, K = self.args, self.dev, self.HZ, self.K
         s, h = self.sample_valid_starts_nosync(buffer, args.pi_batch)
-        S = unflatten_state(s["s"])
+        S = self.unflatten_state(s["s"])
         xi, f, a_prev = s["xi"], s["f"], s["a_prev"]
-        xi_n = normalize_xi(xi)
+        xi_n = self.normalize_context(xi)
         o_hist = self.start_obs_history(h)
         S = self.perturb_start(S)
         set_requires_grad(self.wm, False)

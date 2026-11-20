@@ -20,6 +20,24 @@ FIELDS = {
 }
 
 
+def articulation_fields(num_joints: int) -> dict:
+    """Replay layout for a floating-base character with ``num_joints`` DoFs."""
+
+    if num_joints < 1:
+        raise ValueError("num_joints must be positive")
+    return {
+        "s": (13 + 2 * num_joints, torch.float32),
+        "s1": (13 + 2 * num_joints, torch.float32),
+        "a": (num_joints, torch.float32),
+        "a_prev": (num_joints, torch.float32),
+        "xi": (4 + num_joints, torch.float32),
+        "r": ((), torch.float32),
+        "f": ((), torch.long),
+        "ep_step": ((), torch.int32),
+        "done": ((), torch.bool),
+    }
+
+
 class ReplayBuffer:
     """``fields``: name -> (shape, dtype) of a transition, FIELDS (LAFAN1 tracking) by default; ``window_keys``: the
     fields a k-step window returns; ``priorities``: keep the window priorities of ``sample_windows_prioritized`` (without

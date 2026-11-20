@@ -251,8 +251,18 @@ class Algo:
     def __init__(self, args, kin: ArticulationKinematics, motion: MotionLib, mdp: MDP, dev: str):
         self.args, self.kin, self.motion, self.mdp, self.dev = args, kin, motion, mdp, dev
         self.K, self.Hh, self.HZ = args.goal_frames, args.hist, args.horizon
+        self.unflatten_state = getattr(mdp, "unflatten_state", unflatten_state)
+        self.normalize_context = getattr(mdp, "normalize_context", normalize_xi)
+        self.observation_dim = getattr(mdp, "observation_dim", OBS_DIM)
+        self.goal_frame_dim = getattr(motion, "goal_frame_dim", 73)
+        self.action_dim = getattr(mdp, "action_dim", int(mdp.default_q.numel()))
         self.wm = self.make_world_model().to(dev)
-        self.pi = TrackingPolicy(OBS_DIM, 73 * self.K, hist=self.Hh).to(dev)
+        self.pi = TrackingPolicy(
+            self.observation_dim,
+            self.goal_frame_dim * self.K,
+            hist=self.Hh,
+            action_dim=self.action_dim,
+        ).to(dev)
         # optional (train.py --fused_adam): Adam's fused kernel, not bitwise equal to the default implementation
         self.adam_kw = {"fused": True} if getattr(args, "fused_adam", False) else {}
         # optional (train.py --update_graphs, BlinkMimic): whole updates as CUDA graphs, so the optimizers are capturable,
@@ -331,6 +341,8 @@ class Algo:
         raise NotImplementedError
 
     def make_world_model(self) -> nn.Module:
+        if hasattr(self.mdp, "make_world_model"):
+            return self.mdp.make_world_model(vars(self.args))
         return self.world_model_cls(vars(self.args))
 
     def setpoint(self, a: torch.Tensor, f: torch.Tensor) -> torch.Tensor:
@@ -375,21 +387,21 @@ class Algo:
 
     # ------------------------------------------------------------------ world model
     def _wm_rollout(self, s, a, xi):
-        S = unflatten_state(s[:, 0])
+        S = self.unflatten_state(s[:, 0])
         preds = []
         for j in range(self.args.wm_window):
-            S = self.wm_step(S, a[:, j], normalize_xi(xi[:, j]), self.args.wm_input_noise)
+            S = self.wm_step(S, a[:, j], self.normalize_context(xi[:, j]), self.args.wm_input_noise)
             preds.append(S)
         return tuple(torch.stack([P[i] for P in preds], 1) for i in range(6))  # (B, k, ...)
 
     def _wm_rollout_deferred(self, s, a, xi, taps):
         """``_wm_rollout`` through ``nets.run_mlp_deferred`` (--wm_deferred_grads): ``taps`` per Linear layer the zeros
         (k, B, out) of ``nets.mlp_taps``; also returns each Linear's inputs over the window, (k, B, in)."""
-        S = unflatten_state(s[:, 0])
+        S = self.unflatten_state(s[:, 0])
         steps = [t.unbind(0) for t in taps]  # the steps' slices: their gradients come back stacked
         preds, ins = [], []
         for j in range(self.args.wm_window):
-            S, x = self.wm.step(S, a[:, j], normalize_xi(xi[:, j]), self.args.wm_input_noise, taps=[t[j] for t in steps])
+            S, x = self.wm.step(S, a[:, j], self.normalize_context(xi[:, j]), self.args.wm_input_noise, taps=[t[j] for t in steps])
             preds.append(S), ins.append(x)
         S_hat = tuple(torch.stack([P[i] for P in preds], 1) for i in range(6))  # (B, k, ...)
         return S_hat, [torch.stack([x[i] for x in ins]) for i in range(len(ins[0]))]
@@ -405,14 +417,14 @@ class Algo:
         bf16 penalty was 1.05 times the exact one at eps 0.1 and 3.5 times at 0.01. Under train.py's allow_tf32 the fp32
         matmuls round their inputs to TF32 (10-bit mantissa): 1.0004 times the exact one at 0.1, 1.007 at 0.03, 1.07 at
         0.01, hence the floor of 0.01 on eps."""
-        x = self.wm.in_norm(self.wm.inputs(unflatten_state(s0), a0, normalize_xi(xi0)))
+        x = self.wm.in_norm(self.wm.inputs(self.unflatten_state(s0), a0, self.normalize_context(xi0)))
         return smoothness_penalty(self.wm.net, x, self.args.wm_smooth_eps, self.args.wm_smooth_dirs)
 
     @torch.no_grad()
     def update_wm_norms(self, S0, S1, a, xi):
         """Fit the world model's input and output normalizers on simulator transitions (states S0 -> S1, setpoints a,
         context xi)."""
-        self._update_norm(self.wm.in_norm, self.norm_inputs(S0, a, normalize_xi(xi)))
+        self._update_norm(self.wm.in_norm, self.norm_inputs(S0, a, self.normalize_context(xi)))
         self._update_norm(self.wm.out_norm, self.wm.targets(S0, S1))
         if getattr(self.wm, "structured", False):  # --wm_structured: the plain increments' scale normalizes the fit's loss
             self._update_norm(self.wm.inc_norm, self.wm.increments(S0, S1))
@@ -433,7 +445,7 @@ class Algo:
         """Model-independent k-step prediction error for logging: tracked-body position (m) and joint angle (rad)."""
         m = mask[:, -1] > 0
         Sh = tuple(x[:, -1][m] for x in S_hat)
-        St = unflatten_state(s1[:, -1][m])
+        St = self.unflatten_state(s1[:, -1][m])
         return (self.kin.forward(*Sh)[0] - self.kin.forward(*St)[0]).norm(dim=-1).mean(), (Sh[4] - St[4]).abs().mean()
 
     def wm_update_graphable(self, buffer: ReplayBuffer):
@@ -499,7 +511,7 @@ class Algo:
             raise ValueError("--wm_sample prioritized and --wm_fail_windows cannot be combined")
         wf = None
         if n_fail:
-            failed = lambda s1, f: self.mdp.termination(unflatten_state(s1), f + 1)  # noqa: E731  (as TrackingSim.step)
+            failed = lambda s1, f: self.mdp.termination(self.unflatten_state(s1), f + 1)  # noqa: E731  (as TrackingSim.step)
             wf = buffer.pre_failure_windows(n_fail, args.wm_window, args.wm_fail_window, failed)
         n_rest = args.wm_batch - (0 if wf is None else n_fail)
         if prioritized:
@@ -548,7 +560,7 @@ class Algo:
             return len(idx)
 
         n_fail = round(self.args.imag_fail_starts * B)
-        failed = lambda s1, f: self.mdp.termination(unflatten_state(s1), f + 1)  # noqa: E731  (as TrackingSim.step)
+        failed = lambda s1, f: self.mdp.termination(self.unflatten_state(s1), f + 1)  # noqa: E731  (as TrackingSim.step)
         while n < n_fail:
             points = buffer.pre_failure_points(2 * n_fail, self.args.imag_fail_window, failed)
             got = 0 if points is None else keep(points, n_fail - n)
@@ -590,5 +602,5 @@ class Algo:
     def start_obs_history(self, h: dict) -> torch.Tensor:
         """Noisy observation history of the start states, as the deployed policy would see it."""
         with torch.no_grad():
-            o_hist = self.mdp.obs(unflatten_state(h["s"]), h["a_prev"], h["xi"], h["f"])
+            o_hist = self.mdp.obs(self.unflatten_state(h["s"]), h["a_prev"], h["xi"], h["f"])
         return self.mdp.add_noise(o_hist)

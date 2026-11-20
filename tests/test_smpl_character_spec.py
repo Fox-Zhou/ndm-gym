@@ -4,19 +4,23 @@ import os
 import pytest
 import torch
 
-from ndm_gym.robots.phc_smpl import PHC_SMPL_SPEC, kinematics, validate_mjcf
+from ndm_gym.robots.smpl_character import (
+    SMPL_CHARACTER_SPEC,
+    kinematics,
+    validate_mjcf,
+)
 
 
 ASSET = Path(
     os.environ.get(
-        "PHC_SMPL_MJCF",
+        "SMPL_CHARACTER_MJCF",
         "/ALG/zhouyangchen/human_template/character/phc_smpl/phc_smpl.xml",
     )
 )
 
 
-def test_phc_dimensions_are_derived_from_the_spec():
-    spec = PHC_SMPL_SPEC
+def test_smpl_dimensions_are_derived_from_the_spec():
+    spec = SMPL_CHARACTER_SPEC
     assert spec.num_joints == 69
     assert spec.num_tracked_bodies == 24
     assert spec.state_dim == 151
@@ -25,13 +29,13 @@ def test_phc_dimensions_are_derived_from_the_spec():
     assert spec.action_dim == 69
 
 
-@pytest.mark.skipif(not ASSET.exists(), reason="shared PHC asset is not mounted")
-def test_phc_mjcf_and_multi_hinge_fk_load():
+@pytest.mark.skipif(not ASSET.exists(), reason="shared SMPL asset is not mounted")
+def test_smpl_mjcf_and_multi_hinge_fk_load():
     validate_mjcf(ASSET)
     kin = kinematics(ASSET, "cpu")
     assert kin.has_multi_hinge_bodies
     assert all(len(indices) == 3 for indices in kin.joint_indices[1:])
-    n = PHC_SMPL_SPEC.num_joints
+    n = SMPL_CHARACTER_SPEC.num_joints
     p = torch.zeros(2, 3)
     R = torch.eye(3).expand(2, -1, -1)
     v = torch.zeros_like(p)
@@ -41,7 +45,7 @@ def test_phc_mjcf_and_multi_hinge_fk_load():
     assert out[1].shape == (2, 24, 3, 3)
 
 
-@pytest.mark.skipif(not ASSET.exists(), reason="shared PHC asset is not mounted")
+@pytest.mark.skipif(not ASSET.exists(), reason="shared SMPL asset is not mounted")
 def test_multi_hinge_fk_matches_mujoco():
     import mujoco
     import numpy as np

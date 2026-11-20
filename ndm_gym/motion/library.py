@@ -106,6 +106,7 @@ class MotionLib:
         cat = lambda xs: torch.cat(xs).to(device)  # noqa: E731
         self.root_p, self.root_R, self.root_v, self.root_w = cat(root_p), cat(root_R), cat(root_v), cat(root_w)
         self.q, self.qd = cat(jq), cat(jqd)
+        self.goal_frame_dim = 15 + 2 * self.q.shape[-1]
         with torch.no_grad():
             bp, bR, bv, bw = [], [], [], []
             for s in range(0, self.num_frames, 65536):
@@ -199,7 +200,7 @@ class MotionLib:
         rot = mat_to_6d(Ht @ self.root_R[fut])
         feats = torch.cat(
             (dp, rot, v, w, self.q[fut], qd * 0.1), -1
-        )  # (B,K,73)
+        )  # (B,K,goal_frame_dim)
         return feats.reshape(f.shape[0], -1)
 
     def ref_state(self, f: torch.Tensor):

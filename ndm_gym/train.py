@@ -123,9 +123,15 @@ def add_train_args(parser: argparse.ArgumentParser):
                         help="also checkpoint when the training wall-clock time first reaches each of these hours")  # fmt: skip
     parser.add_argument("--log_every", type=int, default=50)
     parser.add_argument("--motion_dir", type=str, default=os.path.join(REPO, "data", "lafan1_g1"))
-    parser.add_argument("--motions", type=str, default="lafan1", choices=["lafan1", "interhuman"],
+    parser.add_argument("--character", type=str, default="g1", choices=["g1", "smpl"],
+                        help="tracking character backend; smpl uses the configured 69-DoF SMPL asset")
+    parser.add_argument("--motions", type=str, default="lafan1", choices=["lafan1", "interhuman", "bonesseed_smpl"],
                         help="the clips' source: LAFAN1's G1 CSVs, or two-person clips retargeted to two G1s "
                         "(tools/convert_interhuman.py)")  # fmt: skip
+    parser.add_argument("--smpl_mjcf", type=str, default="/ALG/zhouyangchen/human_template/character/phc_smpl/phc_smpl.xml")
+    parser.add_argument("--smpl_usd", type=str, default="/ALG/zhouyangchen/human_template/character/phc_smpl/phc_smpl.usda")
+    parser.add_argument("--max_clips", type=int, default=None,
+                        help="optional SMPL data-loading limit for smoke tests")
     parser.add_argument("--paired", action="store_true",
                         help="the two-robot scene: each env's two G1s track the two sides of a two-person clip "
                         "(--num_envs counts robots)")  # fmt: skip
@@ -249,6 +255,33 @@ def parse_args():
         parser.error("--pi_encode_once: SuperTrack's and SuperMimic's imagination only")
     if args.paired and (args.motions != "interhuman" or args.num_envs % 2):
         parser.error("--paired: two-person clips (--motions interhuman) and an even --num_envs (two robots per env)")
+    if args.character == "smpl":
+        if args.motions != "bonesseed_smpl":
+            parser.error("--character smpl needs --motions bonesseed_smpl")
+        if args.paired:
+            parser.error("--character smpl does not use the paired G1 scene")
+        if args.layout != "1GPU":
+            parser.error("--character smpl currently uses the 1GPU NDM layout")
+        if args.collect_graph or args.update_graphs or args.reset_masked:
+            parser.error("SMPL simulator collection currently runs eagerly")
+        if args.wm_deferred_grads:
+            parser.error("SMPL MLP does not enable deferred world-model gradients")
+        if args.wm_mirror > 0:
+            parser.error("SMPL left-right replay mirroring is not defined yet")
+        if args.contact_reward > 0:
+            parser.error("SMPL contact reward calibration is not defined yet")
+        if args.imag_hoist or args.pi_deferred_grads:
+            parser.error(
+                "SMPL observations do not enable the G1-specific imagined-step hoist"
+            )
+        if args.eprobe_share > 0:
+            parser.error("SMPL evaluation-guided reset probes are not implemented yet")
+        if args.sm_residual:
+            parser.error(
+                "SMPL SuperMimic currently uses absolute joint setpoints"
+            )
+    elif args.motions == "bonesseed_smpl":
+        parser.error("--motions bonesseed_smpl needs --character smpl")
     return args
 
 
@@ -373,12 +406,12 @@ def main():
     from ndm_gym.core.normalizer import RunningNorm
     from ndm_gym.algos.common import lr_at, set_lr
     from ndm_gym.algos.eprobe import EvalProbe
-    from ndm_gym.buffer import ReplayBuffer
+    from ndm_gym.buffer import ReplayBuffer, articulation_fields
     from ndm_gym.motion.library import MotionLib
     from ndm_gym.motion.sources import lafan1, read_clip_list, select
     from ndm_gym.robots import g1
     from ndm_gym.sim.rigid.isaaclab_mjwarp import PairedTrackingSim, TrackingSim, make_sim
-    from ndm_gym.state import unflatten_state
+    from ndm_gym.state import unflatten_state as unflatten_g1_state
     from ndm_gym.tasks.tracking import MDP, OBS_DIM
 
     torch.backends.cuda.matmul.allow_tf32 = True
@@ -394,21 +427,78 @@ def main():
     os.makedirs(args.log_dir, exist_ok=True)
     json.dump(vars(args), open(os.path.join(args.log_dir, "args.json"), "w"), indent=2)
 
-    kin = g1.kinematics(dev)
-    if args.motions == "interhuman":
-        from ndm_gym.motion.sources import interhuman
+    if args.character == "smpl":
+        from ndm_gym.motion.sources import bonesseed_smpl
+        from ndm_gym.robots.smpl_character import (
+            SMPL_CHARACTER_SPEC,
+            kinematics as smpl_kinematics,
+        )
+        from ndm_gym.sim.rigid.smpl_mjwarp import (
+            SMPLTrackingSim,
+            make_sim as make_smpl_sim,
+        )
+        from ndm_gym.tasks.articulation_tracking import (
+            ArticulationRewardCfg,
+            ArticulationTrackingMDP,
+        )
 
-        clips = interhuman.load(args.motion_dir)
+        kin = smpl_kinematics(args.smpl_mjcf, dev)
+        clips = bonesseed_smpl.load_dir(args.motion_dir, max_clips=args.max_clips)
+        make_tracking_sim = make_smpl_sim
+        tracking_sim_cls = SMPLTrackingSim
     else:
-        clips = lafan1.load_dir(args.motion_dir)
+        kin = g1.kinematics(dev)
+        if args.motions == "interhuman":
+            from ndm_gym.motion.sources import interhuman
+
+            clips = interhuman.load(args.motion_dir)
+        else:
+            clips = lafan1.load_dir(args.motion_dir)
+        make_tracking_sim = make_sim
+        tracking_sim_cls = PairedTrackingSim if args.paired else TrackingSim
     if args.clips:
         clips = select(clips, read_clip_list(args.clips))
         with open(os.path.join(args.log_dir, "clips.txt"), "w") as f:  # the clips trained on, whatever the list file says later
             f.write("".join(f"{c.name}\n" for c in clips))
     motion = MotionLib(clips, kin, dev)
+    if args.character == "smpl":
+        reward_cfg = ArticulationRewardCfg()
+        if args.reward_std_scale != 1.0:
+            for name in (
+                "body_pos_std",
+                "body_ori_std",
+                "body_linvel_std",
+                "body_angvel_std",
+                "root_pos_std",
+                "root_ori_std",
+            ):
+                setattr(
+                    reward_cfg,
+                    name,
+                    args.reward_std_scale * getattr(reward_cfg, name),
+                )
+        mdp = ArticulationTrackingMDP(
+            SMPL_CHARACTER_SPEC,
+            kin,
+            motion,
+            torch.zeros(SMPL_CHARACTER_SPEC.num_joints, device=dev),
+            cfg=reward_cfg,
+        )
+        replay_fields = articulation_fields(SMPL_CHARACTER_SPEC.num_joints)
+        unflatten_training_state = mdp.unflatten_state
+        observation_dim = mdp.observation_dim
+    else:
+        mdp = MDP(
+            kin,
+            motion,
+            torch.tensor(g1.default_joint_pos_list(), device=dev),
+            training_reward_cfg(args.reward_std_scale),
+        )
+        replay_fields = None
+        unflatten_training_state = unflatten_g1_state
+        observation_dim = OBS_DIM
     if args.goal_table:
         motion.cache_goals(args.goal_frames)
-    mdp = MDP(kin, motion, torch.tensor(g1.default_joint_pos_list(), device=dev), training_reward_cfg(args.reward_std_scale))
     K, Hh = args.goal_frames, args.hist
     algo = ALGOS[args.algo](args, kin, motion, mdp, dev)
     pi_lr = PolicyLR(args)  # --pi_lr_mult
@@ -426,9 +516,20 @@ def main():
         resume_ck = ck
     profile = bool(int(os.environ.get("SM_PROFILE", "0")))
 
-    sim_cfg = make_sim(dev, args, paired=args.paired, njmax=args.njmax or None)  # --njmax (XMimic): the training simulator's rows
+    sim_cfg = (
+        make_tracking_sim(dev)
+        if args.character == "smpl"
+        else make_tracking_sim(
+            dev, args, paired=args.paired, njmax=args.njmax or None
+        )
+    )
     with launch_simulation(sim_cfg, args):
-        env = (PairedTrackingSim if args.paired else TrackingSim)(sim_cfg, args.num_envs, motion, mdp, gamma=args.gamma, **reset_kwargs(args))
+        env_kwargs = {"gamma": args.gamma, **reset_kwargs(args)}
+        if args.character == "smpl":
+            env_kwargs["usd_path"] = args.smpl_usd
+        env = tracking_sim_cls(
+            sim_cfg, args.num_envs, motion, mdp, **env_kwargs
+        )
         if args.compile_eager:
             env.reward_fn = torch.compile(mdp.reward)
         assert torch.allclose(env.default_q, mdp.default_q), (env.default_q, mdp.default_q)
@@ -441,10 +542,18 @@ def main():
                 probe.load_state_dict(resume_ck)
         if algo.residual:
             assert torch.equal(env.alpha, algo.alpha), (env.alpha, algo.alpha)
-        buffer = ReplayBuffer(args.buffer_steps, args.num_envs, dev, priorities=args.wm_sample == "prioritized")
+        buffer = ReplayBuffer(
+            args.buffer_steps,
+            args.num_envs,
+            dev,
+            fields=replay_fields,
+            priorities=args.wm_sample == "prioritized",
+        )
         if args.update_graphs:  # BlinkMimic's --cuda_graph: sampling bounds on the device (--graph_early: the fill level too)
             buffer.use_device_ptr(device_size=args.graph_early)
-        obs_hist = torch.zeros(args.num_envs, Hh, OBS_DIM, device=dev)
+        obs_hist = torch.zeros(
+            args.num_envs, Hh, observation_dim, device=dev
+        )
         graphed_step = GraphedCollector(env, algo, buffer, mdp, motion, obs_hist, args) if args.collect_graph else None
         split = None
         if args.layout != "1GPU":  # --layout (XMimic): the iteration's steps on their own GPUs, each on the others' previous results
@@ -493,7 +602,12 @@ def main():
                 a = torch.clamp(a + args.action_noise * torch.randn_like(a), -20, 20)
                 out = env.step(a, S)  # S: the state just read, nothing written since
                 buffer.add(out)
-                algo.update_wm_norms(unflatten_state(out["s"]), unflatten_state(out["s1"]), out["a"], out["xi"])
+                algo.update_wm_norms(
+                    unflatten_training_state(out["s"]),
+                    unflatten_training_state(out["s1"]),
+                    out["a"],
+                    out["xi"],
+                )
                 sim_steps += args.num_envs
                 stats["r"].append(out["r"].mean() / 0.1)
                 stats["rate"].append(out["terms"]["action_rate"].mean())
@@ -530,6 +644,22 @@ def main():
             ck = {**algo.state_dict(), **pi_lr.state_dict(), **(probe.state_dict() if probe is not None else {}), "iteration": iteration,
                   "wall_time": time.time() - t_start, "sim_steps": sim_steps, "args": vars(args),
                   "saved_at": time.strftime("%Y-%m-%d %H:%M:%S")}  # fmt: skip
+            if args.character == "smpl":
+                ck.update(
+                    format="ndm-gym-supermimic-smpl-v1",
+                    character={
+                        "joint_names": list(SMPL_CHARACTER_SPEC.joint_names),
+                        "tracked_bodies": list(
+                            SMPL_CHARACTER_SPEC.tracked_bodies
+                        ),
+                        "foot_bodies": list(SMPL_CHARACTER_SPEC.foot_bodies),
+                        "root_body": SMPL_CHARACTER_SPEC.root_body,
+                    },
+                    default_q=mdp.default_q.detach().cpu(),
+                    normalized_context=mdp.normalize_context(
+                        env.xi[0].detach()
+                    ).cpu(),
+                )
             last = os.path.join(args.log_dir, "last.pt")
             torch.save(ck, last + ".tmp")
             os.replace(last + ".tmp", last)
@@ -630,7 +760,25 @@ def main():
                     print(f"last.pt at it {it + 1} ({wall / 60:.1f} min of training, --last_every_min)", flush=True)
             elif (it + 1) % args.ckpt_every == 0 or final_ck or marks:
                 ck = save_last(it + 1)
-                small = {k: ck[k] for k in ("pi", "wm", "iteration", "wall_time", "sim_steps", "args", "saved_at")}
+                small_keys = [
+                    "pi",
+                    "wm",
+                    "iteration",
+                    "wall_time",
+                    "sim_steps",
+                    "args",
+                    "saved_at",
+                ]
+                if args.character == "smpl":
+                    small_keys.extend(
+                        (
+                            "format",
+                            "character",
+                            "default_q",
+                            "normalized_context",
+                        )
+                    )
+                small = {key: ck[key] for key in small_keys}
                 path = os.path.join(args.log_dir, f"ckpt_{it + 1:06d}.pt")
                 torch.save(small, path + ".tmp")
                 os.replace(path + ".tmp", path)

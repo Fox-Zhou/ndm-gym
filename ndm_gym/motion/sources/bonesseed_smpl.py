@@ -1,4 +1,4 @@
-"""Compact BonesSEED UMR++ motions mapped to the 69-DoF PHC character."""
+"""Compact BonesSEED UMR++ motions mapped to the 69-DoF SMPL character."""
 
 from __future__ import annotations
 
@@ -17,7 +17,9 @@ def load_dir(path: str | Path, max_clips: int | None = None) -> list[Clip]:
     if max_clips is not None:
         files = files[:max_clips]
     if not files:
-        raise FileNotFoundError(f"no converted PHC motions (motion.npz) under {root}")
+        raise FileNotFoundError(
+            f"no converted SMPL-character motions (motion.npz) under {root}"
+        )
     clips: list[Clip] = []
     for name in files:
         file = Path(name)

@@ -83,9 +83,23 @@ class ArticulationIncrementWorldModel(nn.Module):
             -1,
         )
 
-    def step(self, state, action, normalized_context):
+    def step(
+        self,
+        state,
+        action,
+        normalized_context,
+        input_noise: float = 0.0,
+        taps=None,
+    ):
+        if taps is not None:
+            raise ValueError(
+                "deferred world-model gradients are not enabled for the "
+                "character-generic MLP"
+            )
         p, R, v, w, q, qd = state
         x = self.in_norm(self.inputs(state, action, normalized_context))
+        if input_noise != 0:
+            x = x + input_noise * torch.randn_like(x)
         y = run_mlp(self.net, x, amp=self.amp)
         delta = y * self.out_norm.std() + self.out_norm.mean
         n = self.spec.num_joints
@@ -98,5 +112,28 @@ class ArticulationIncrementWorldModel(nn.Module):
             w + (R @ dw.unsqueeze(-1)).squeeze(-1),
             q + dq,
             qd + dqd,
+        )
+
+    @staticmethod
+    def state_error(predicted, target):
+        """Frame-local state error with the same layout as ``targets``."""
+
+        p, R, v, w, q, qd = target
+        ph, Rh, vh, wh, qh, qdh = predicted
+        heading = yaw_mat(R)
+        rotation_t = R.transpose(-1, -2)
+        return torch.cat(
+            (
+                (
+                    heading.transpose(-1, -2)
+                    @ (ph - p).unsqueeze(-1)
+                ).squeeze(-1),
+                so3_log(rotation_t @ Rh),
+                (rotation_t @ (vh - v).unsqueeze(-1)).squeeze(-1),
+                (rotation_t @ (wh - w).unsqueeze(-1)).squeeze(-1),
+                qh - q,
+                qdh - qd,
+            ),
+            -1,
         )
 
