@@ -58,6 +58,19 @@ class ArticulationTrackingMDP:
         self.spec, self.kin, self.reference = spec, kin, reference
         self.default_q, self.control_dt = default_q, float(control_dt)
         self.cfg = cfg or ArticulationRewardCfg()
+        self.observation_dim = spec.observation_dim
+        self.goal_frame_dim = spec.goal_frame_dim
+        self.max_step_reward = 5.0 * self.control_dt
+        self.obs_noise = torch.cat(
+            (
+                torch.full((spec.num_joints,), 0.01, device=default_q.device),
+                torch.full((spec.num_joints,), 0.5, device=default_q.device),
+                torch.full((3,), 0.2, device=default_q.device),
+                torch.full((3,), 0.05, device=default_q.device),
+                torch.zeros(spec.num_joints, device=default_q.device),
+                torch.full((6,), 0.05, device=default_q.device),
+            )
+        )
         mid, half = (kin.q_lo + kin.q_hi) / 2, (kin.q_hi - kin.q_lo) / 2
         self.soft_lo = mid - half * self.cfg.soft_limit_factor
         self.soft_hi = mid + half * self.cfg.soft_limit_factor
@@ -66,11 +79,8 @@ class ArticulationTrackingMDP:
         p, R, _, w, q, qd = state
         if previous_action.shape[-1] != self.spec.action_dim:
             raise ValueError("previous action does not match character")
-        relative = mat_to_6d(
-            R.transpose(-1, -2) @ self.reference.root_R[
-                torch.arange(frames.shape[0], device=frames.device), frames
-            ]
-        )
+        reference_root_R = self.reference.ref_state(frames)[1]
+        relative = mat_to_6d(R.transpose(-1, -2) @ reference_root_R)
         gravity_body = -R[..., 2, :]
         root_w_body = (
             R.transpose(-1, -2) @ w.unsqueeze(-1)
@@ -82,6 +92,15 @@ class ArticulationTrackingMDP:
         if result.shape[-1] != self.spec.observation_dim:
             raise RuntimeError("derived observation dimension is inconsistent")
         return result
+
+    # The native G1 trainer calls these two names.  Keeping the aliases here
+    # lets a character-generic collector use the same training semantics.
+    def obs(self, state, previous_action, context, frames):
+        del context
+        return self.observation(state, previous_action, frames)
+
+    def add_noise(self, observation):
+        return observation + (2 * torch.rand_like(observation) - 1) * self.obs_noise
 
     def reward(self, state, frames, action, previous_action, *, terms=False):
         c, ref = self.cfg, self.reference
@@ -136,13 +155,18 @@ class ArticulationTrackingMDP:
 
     def soft_termination(self, state, frames, *, tz=0.02, tt=0.04):
         p, R = state[0], state[1]
-        batch = torch.arange(frames.shape[0], device=frames.device)
-        rp = self.reference.root_p[batch, frames]
-        rR = self.reference.root_R[batch, frames]
+        rp, rR = self.reference.ref_state(frames)[:2]
         e_z = (rp[..., 2] - p[..., 2]).abs()
         e_tilt = (rR[..., 2, 2] - R[..., 2, 2]).abs()
         alive = (1 - torch.sigmoid((e_z - self.cfg.term_height) / tz)) * (
             1 - torch.sigmoid((e_tilt - self.cfg.term_tilt) / tt)
         )
         return 1 - alive
+
+    def termination(self, state, frames):
+        p, R = state[0], state[1]
+        rp, rR = self.reference.ref_state(frames)[:2]
+        e_z = (rp[..., 2] - p[..., 2]).abs()
+        e_tilt = (rR[..., 2, 2] - R[..., 2, 2]).abs()
+        return (e_z > self.cfg.term_height) | (e_tilt > self.cfg.term_tilt)
 
