@@ -135,6 +135,7 @@ class SMPLTrackingSim:
                 replicate_physics=True,
                 robot=replace(
                     SMPL_CFG,
+                    prim_path="{ENV_REGEX_NS}/Robot",
                     spawn=replace(SMPL_CFG.spawn, usd_path=str(usd_path)),
                 ),
             )
