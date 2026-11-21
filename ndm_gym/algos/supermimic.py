@@ -9,6 +9,8 @@ import time
 import torch
 import torch.nn as nn
 
+from ndm_gym import distributed
+
 from ..buffer import ReplayBuffer
 from ..core.nets import deferred_grads, mlp_taps, run_mlp, run_mlp_deferred
 from ..policies.critic import Critic
@@ -295,6 +297,7 @@ class SuperMimic(Algo):
         if PROFILE:
             torch.cuda.synchronize()
             tq2 = time.time()
+        distributed.average_gradients(self.pi.parameters())
         gn = nn.utils.clip_grad_norm_(self.pi.parameters(), 1.0)
         nn.utils.clip_grad_value_(self.pi.parameters(), 0.1)
         if torch.isfinite(gn):
@@ -339,6 +342,7 @@ class SuperMimic(Algo):
                         v_loss = ((self.critic(Xf[idx]) - Yf[idx]) ** 2).mean()
                         self.opt_v.zero_grad(set_to_none=True)
                         v_loss.backward()
+                        distributed.average_gradients(self.critic.parameters())
                         nn.utils.clip_grad_norm_(self.critic.parameters(), 1.0)
                         self.opt_v.step()
         if PROFILE:

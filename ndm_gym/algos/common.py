@@ -7,6 +7,8 @@ import math
 import torch
 import torch.nn as nn
 
+from ndm_gym import distributed
+
 from ..buffer import ReplayBuffer
 from ..core.kinematics import ArticulationKinematics
 from ..core.muon import MuonAdam
@@ -475,6 +477,7 @@ class Algo:
         objective.backward()
         if self.wm_deferred:
             deferred_grads(self.wm.net, ins, taps, self.deferred_bf16)
+        distributed.average_gradients(self.wm.parameters())
         nn.utils.clip_grad_norm_(self.wm.parameters(), 1.0)
         self.opt_wm.step()
         return loss, e8, per_window, S_hat

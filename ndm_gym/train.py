@@ -139,6 +139,8 @@ def add_train_args(parser: argparse.ArgumentParser):
                         help="train on the clips listed in this file (one name per line) instead of every clip in --motion_dir")  # fmt: skip
     parser.add_argument("--log_dir", type=str, default=os.path.join(REPO, "logs", "run"))
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--dist_timeout_min", type=int, default=30,
+                        help="torchrun: process-group timeout in minutes (WORLD_SIZE > 1 enables synchronous data parallel training)")
     parser.add_argument("--resume", type=str, default=None)
     parser.add_argument("--amp", type=str, default="bf16", choices=["none", "bf16"], help="autocast dtype for MLP matmuls")
 
@@ -282,6 +284,22 @@ def parse_args():
             )
     elif args.motions == "bonesseed_smpl":
         parser.error("--motions bonesseed_smpl needs --character smpl")
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    if world_size > 1:
+        if args.algo != "supermimic":
+            parser.error("torchrun data parallelism currently supports --algo supermimic")
+        if args.layout != "1GPU":
+            parser.error("torchrun owns the multi-GPU layout; keep --layout 1GPU on each rank")
+        if args.update_graphs or args.collect_graph or args.reset_masked:
+            parser.error("distributed training does not capture an entire collection/update in one CUDA graph")
+        if args.critic_cudagraphs:
+            parser.error("distributed critic gradients must be averaged before its optimizer step; disable --critic_cudagraphs")
+        if args.no_sync:
+            parser.error("distributed normalizers need global batch moments; disable --no_sync")
+        if args.eprobe_share > 0:
+            parser.error("distributed training does not yet synchronize evaluation-guided reset probes")
+        if args.dist_timeout_min <= 0:
+            parser.error("--dist_timeout_min must be positive")
     return args
 
 
@@ -400,6 +418,7 @@ def main():
 
     import torch
 
+    from ndm_gym import distributed
     import ndm_gym.core.nets as nets
     from ndm_gym.algos import ALGOS
     from ndm_gym.algos.blinkmimic import PolicyLR, check_resume, reset_kwargs
@@ -414,6 +433,11 @@ def main():
     from ndm_gym.state import unflatten_state as unflatten_g1_state
     from ndm_gym.tasks.tracking import MDP, OBS_DIM
 
+    dev = distributed.initialize(args.dist_timeout_min)
+    atexit.register(distributed.shutdown)
+    args.distributed_world_size = distributed.world_size()
+    if hasattr(args, "device"):
+        args.device = dev
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
     torch.manual_seed(args.seed)
@@ -423,9 +447,11 @@ def main():
         elementwise_3x3_products()
     if args.combo_kernels:
         combo_kernels()
-    dev = "cuda:0"
-    os.makedirs(args.log_dir, exist_ok=True)
-    json.dump(vars(args), open(os.path.join(args.log_dir, "args.json"), "w"), indent=2)
+    if distributed.is_main():
+        os.makedirs(args.log_dir, exist_ok=True)
+        with open(os.path.join(args.log_dir, "args.json"), "w") as f:
+            json.dump(vars(args), f, indent=2)
+    distributed.barrier()
 
     if args.character == "smpl":
         from ndm_gym.motion.sources import bonesseed_smpl
@@ -458,8 +484,9 @@ def main():
         tracking_sim_cls = PairedTrackingSim if args.paired else TrackingSim
     if args.clips:
         clips = select(clips, read_clip_list(args.clips))
-        with open(os.path.join(args.log_dir, "clips.txt"), "w") as f:  # the clips trained on, whatever the list file says later
-            f.write("".join(f"{c.name}\n" for c in clips))
+        if distributed.is_main():
+            with open(os.path.join(args.log_dir, "clips.txt"), "w") as f:  # the clips trained on, whatever the list file says later
+                f.write("".join(f"{c.name}\n" for c in clips))
     motion = MotionLib(clips, kin, dev)
     if args.character == "smpl":
         reward_cfg = ArticulationRewardCfg()
@@ -514,7 +541,13 @@ def main():
         pi_lr.load_state_dict(ck)
         start_it, wall_offset, sim_steps = ck["iteration"], ck["wall_time"], ck["sim_steps"]
         resume_ck = ck
-    profile = bool(int(os.environ.get("SM_PROFILE", "0")))
+    for module in (algo.wm, algo.pi, getattr(algo, "critic", None), getattr(getattr(algo, "pi_avg", None), "module", None)):
+        if module is not None:
+            distributed.broadcast_module(module)
+    distributed.barrier()
+    # Identical parameters, but independent simulator, replay and minibatch streams.
+    torch.manual_seed(args.seed + 100_003 * distributed.rank())
+    profile = distributed.is_main() and bool(int(os.environ.get("SM_PROFILE", "0")))
 
     sim_cfg = (
         make_tracking_sim(dev)
@@ -571,13 +604,15 @@ def main():
             print(split.describe(), flush=True)
             algo = split.algo  # what the loop reads from here on, each from its owner (the collection's graph keeps the actor's object)
 
+        global_num_envs = args.num_envs * distributed.world_size()
+
         @torch.no_grad()
         def collect(n_steps: int, stats: dict):
             nonlocal obs_hist, sim_steps
             if args.collect_graph:
                 for _ in range(n_steps):
                     core = graphed_step()
-                    sim_steps += args.num_envs
+                    sim_steps += global_num_envs
                     stats["r"].append(core["r"].clone())
                     stats["rate"].append(core["rate"].clone())
                     if args.reset_masked:  # every step appends; a step without an ended episode carries NaN means
@@ -608,7 +643,7 @@ def main():
                     out["a"],
                     out["xi"],
                 )
-                sim_steps += args.num_envs
+                sim_steps += global_num_envs
                 stats["r"].append(out["r"].mean() / 0.1)
                 stats["rate"].append(out["terms"]["action_rate"].mean())
                 if "ep_len" in out:
@@ -622,12 +657,12 @@ def main():
         collect(args.warmup_steps, stats)
         if args.update_graphs:
             wm_update_g, policy_update_g = update_graphs(algo, buffer, args) if split is None else split.update_graphs()
-        log_f = open(os.path.join(args.log_dir, "train_log.csv"), "a")
-        if start_it == 0:
+        log_f = open(os.path.join(args.log_dir, "train_log.csv"), "a") if distributed.is_main() else None
+        if distributed.is_main() and start_it == 0:
             log_f.write("iteration,wall_h,sim_steps,wm_loss,wm_err8,pi_loss,v_loss,imag_rew,pi_gradnorm,imag_survival,sim_rew,ep_len,"
                         "ep_ret_norm,term_frac,it_per_s,lr,wm_body8_m,wm_q8_rad,sim_action_rate,fail_starts"
                         + (",nonfinite" if args.no_sync else "") + "\n")  # fmt: skip
-        light = LightCheckpoints() if args.ckpt_light else None
+        light = LightCheckpoints() if args.ckpt_light and distributed.is_main() else None
         if args.gc_freeze:  # --gc_freeze (XMimic): what the setup allocated leaves the collector's generations
             gc.collect()
             gc.freeze()
@@ -641,6 +676,8 @@ def main():
 
         def save_last(iteration: int) -> dict:
             """The full checkpoint, which --resume continues from, as last.pt (written whole, then renamed); returns it."""
+            if not distributed.is_main():
+                raise RuntimeError("only rank 0 writes checkpoints")
             ck = {**algo.state_dict(), **pi_lr.state_dict(), **(probe.state_dict() if probe is not None else {}), "iteration": iteration,
                   "wall_time": time.time() - t_start, "sim_steps": sim_steps, "args": vars(args),
                   "saved_at": time.strftime("%Y-%m-%d %H:%M:%S")}  # fmt: skip
@@ -667,7 +704,8 @@ def main():
 
         for it in range(start_it, args.iterations):
             if args.lr_decay_hours is not None:
-                lr = lr_at((time.time() - t_start) / 3600, args.lr, args.lr_decay_hours)
+                elapsed_h = distributed.rank0_scalar((time.time() - t_start) / 3600, dev)
+                lr = lr_at(elapsed_h, args.lr, args.lr_decay_hours)
             else:
                 lr = lr_at(it, args.lr, args.lr_decay_iters)
             for o in algo.optimizers:
@@ -726,72 +764,89 @@ def main():
             if split is not None:  # --layout: the next batch drawn; batch, world model, normalizers and policy cross the devices
                 split.exchange()
             if log_now:
-                mean = lambda x: float(sum(float(v) for v in x) / max(len(x), 1))  # noqa: E731
-                mean_nn = lambda x: mean([v for v in (float(v) for v in x) if v == v])  # noqa: E731  (--reset_masked: NaN = no end)
+                local_mean = lambda x: float(sum(float(v) for v in x) / max(len(x), 1))  # noqa: E731
+                local_mean_nn = lambda x: local_mean([v for v in (float(v) for v in x) if v == v])  # noqa: E731
+                mean = lambda x: distributed.mean_scalar(local_mean(x), dev)  # noqa: E731
+                mean_nn = lambda x: distributed.mean_scalar(local_mean_nn(x), dev)  # noqa: E731
                 ips = args.log_every / (time.time() - t_log)
                 t_log = time.time()
                 wall_h = (time.time() - t_start) / 3600
-                term_frac = float(sum(float(v) for v in stats["term"]) / max(sum(float(v) for v in stats["done"]), 1))
-                probes = (float(res[2]), float(res[3])) if len(res) > 2 else (float("nan"), float("nan"))
+                term_sum, done_sum = distributed.sum_pair(
+                    sum(float(v) for v in stats["term"]), sum(float(v) for v in stats["done"]), dev
+                )
+                term_frac = term_sum / max(done_sum, 1)
+                probes = (
+                    distributed.mean_scalar(res[2], dev),
+                    distributed.mean_scalar(res[3], dev),
+                ) if len(res) > 2 else (float("nan"), float("nan"))
                 row = [it + 1, wall_h, sim_steps, mean(agg["wm"]), mean(agg["wm8"]), mean(agg["pi"]), mean(agg["v"]), mean(agg["ir"]),
                        mean(agg["gn"]), mean(agg["surv"]), mean(stats["r"]), mean_nn(stats["ep_len"]), mean_nn(stats["ep_ret"]), term_frac, ips,
                        algo.log_lr(lr), *probes, mean(stats["rate"]), mean(agg["fs"])]  # fmt: skip
                 if args.no_sync:
                     row.append(int(algo.nonfinite))
-                log_f.write(",".join(f"{x:.6g}" if isinstance(x, float) else str(x) for x in row) + "\n")
-                log_f.flush()
-                print(f"it {it + 1} | {wall_h:.3f} h | wm {row[3]:.4f} e8 {row[4]:.4f} | pi {row[5]:.3f} v {row[6]:.4f} imag_r {row[7]:.3f} surv {row[9]:.3f} "
-                      f"| sim_r {row[10]:.3f} ep_len {row[11]:.1f} ep_ret {row[12]:.3f} term {term_frac:.2f} | {ips:.2f} it/s", flush=True)  # fmt: skip
+                if distributed.is_main():
+                    log_f.write(",".join(f"{x:.6g}" if isinstance(x, float) else str(x) for x in row) + "\n")
+                    log_f.flush()
+                    print(f"it {it + 1} | {wall_h:.3f} h | wm {row[3]:.4f} e8 {row[4]:.4f} | pi {row[5]:.3f} v {row[6]:.4f} imag_r {row[7]:.3f} surv {row[9]:.3f} "
+                          f"| sim_r {row[10]:.3f} ep_len {row[11]:.1f} ep_ret {row[12]:.3f} term {term_frac:.2f} | {ips:.2f} it/s", flush=True)  # fmt: skip
                 msg = pi_lr.observe(it + 1, row[12])  # --lr_decay_ret's trigger
-                if msg:
+                if msg and distributed.is_main():
                     print(msg, flush=True)
                 stats = {k: [] for k in stats}
                 agg = {k: [] for k in agg}
             trained_h = (time.time() - t_start) / 3600
+            if args.max_hours is not None:
+                # All ranks must leave the loop together. Rank 0 owns the
+                # wall-clock budget because it may occasionally pause to save.
+                trained_h = distributed.rank0_scalar(trained_h, dev)
             out_of_time = args.max_hours is not None and trained_h >= args.max_hours
-            marks = [h for h in hours_left if trained_h >= h]
+            marks = [h for h in hours_left if trained_h >= h] if distributed.is_main() else []
             final_ck = it + 1 == args.iterations or out_of_time
-            if light is not None and not final_ck and ((it + 1) % args.ckpt_every == 0 or marks):
-                wall = time.time() - t_start
-                light.save(algo, it + 1, wall, sim_steps, args)
-                if last_due(wall, last_time, args.last_every_min):  # --last_every_min: the full last.pt too
-                    save_last(it + 1)
-                    last_time = wall
-                    print(f"last.pt at it {it + 1} ({wall / 60:.1f} min of training, --last_every_min)", flush=True)
-            elif (it + 1) % args.ckpt_every == 0 or final_ck or marks:
-                ck = save_last(it + 1)
-                small_keys = [
-                    "pi",
-                    "wm",
-                    "iteration",
-                    "wall_time",
-                    "sim_steps",
-                    "args",
-                    "saved_at",
-                ]
-                if args.character == "smpl":
-                    small_keys.extend(
-                        (
-                            "format",
-                            "character",
-                            "default_q",
-                            "normalized_context",
+            if distributed.is_main():
+                if light is not None and not final_ck and ((it + 1) % args.ckpt_every == 0 or marks):
+                    wall = time.time() - t_start
+                    light.save(algo, it + 1, wall, sim_steps, args)
+                    if last_due(wall, last_time, args.last_every_min):  # --last_every_min: the full last.pt too
+                        save_last(it + 1)
+                        last_time = wall
+                        print(f"last.pt at it {it + 1} ({wall / 60:.1f} min of training, --last_every_min)", flush=True)
+                elif (it + 1) % args.ckpt_every == 0 or final_ck or marks:
+                    ck = save_last(it + 1)
+                    small_keys = [
+                        "pi",
+                        "wm",
+                        "iteration",
+                        "wall_time",
+                        "sim_steps",
+                        "args",
+                        "saved_at",
+                    ]
+                    if args.character == "smpl":
+                        small_keys.extend(
+                            (
+                                "format",
+                                "character",
+                                "default_q",
+                                "normalized_context",
+                            )
                         )
-                    )
-                small = {key: ck[key] for key in small_keys}
-                path = os.path.join(args.log_dir, f"ckpt_{it + 1:06d}.pt")
-                torch.save(small, path + ".tmp")
-                os.replace(path + ".tmp", path)
+                    small = {key: ck[key] for key in small_keys}
+                    path = os.path.join(args.log_dir, f"ckpt_{it + 1:06d}.pt")
+                    torch.save(small, path + ".tmp")
+                    os.replace(path + ".tmp", path)
             for h in marks:
                 hours_left.remove(h)
-                print(f"checkpoint at {h:g} h of training: it {it + 1}", flush=True)
+                if distributed.is_main():
+                    print(f"checkpoint at {h:g} h of training: it {it + 1}", flush=True)
             if out_of_time:
-                print(f"time budget of {args.max_hours} h reached at it {it + 1}", flush=True)
+                if distributed.is_main():
+                    print(f"time budget of {args.max_hours} h reached at it {it + 1}", flush=True)
                 break
         if light is not None:
             light.close()
         if probe is not None:
             probe.close()
+        distributed.barrier()
 
 
 if __name__ == "__main__":

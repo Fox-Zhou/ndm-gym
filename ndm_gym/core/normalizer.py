@@ -28,8 +28,15 @@ class RunningNorm(nn.Module):
         x = x.reshape(-1, x.shape[-1]).float()
         if not RunningNorm.no_sync and self.count >= self.max_count:
             return
-        n = x.shape[0]
-        m, v = x.mean(0), x.var(0, unbiased=False)
+        from ndm_gym import distributed
+
+        if distributed.enabled():
+            if RunningNorm.no_sync or gate is not None:
+                raise RuntimeError("distributed RunningNorm does not support --no_sync or gated updates")
+            n, m, v = distributed.global_batch_moments(x)
+        else:
+            n = x.shape[0]
+            m, v = x.mean(0), x.var(0, unbiased=False)
         tot = self.count + n
         delta = m - self.mean
         if RunningNorm.no_sync:
