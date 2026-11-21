@@ -51,11 +51,16 @@ def initialize(timeout_minutes: int = 30) -> str:
     else:
         raise ValueError(f"unsupported NDM_GYM_DIST_BACKEND={backend!r}")
     if not dist.is_initialized():
-        dist.init_process_group(
-            backend=backend,
-            init_method="env://",
-            timeout=timedelta(minutes=timeout_minutes),
-        )
+        init_kwargs = {
+            "backend": backend,
+            "init_method": "env://",
+            "timeout": timedelta(minutes=timeout_minutes),
+        }
+        if backend == "nccl":
+            # Prevent NCCL from guessing a device from the global rank. The
+            # explicit binding is also correct when a later run spans nodes.
+            init_kwargs["device_id"] = torch.device(device)
+        dist.init_process_group(**init_kwargs)
         _initialized_here = True
     return device
 
