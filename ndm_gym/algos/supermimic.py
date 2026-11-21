@@ -82,10 +82,10 @@ class SuperMimic(Algo):
                 else foot_bodies()
             )
             self.ref_contact = reference_contact(motion, self.feet, calibrated=args.ref_contact_fix)
-        self.wm_err = torch.compile(self._wm_err, **self.wm_compile)
-        self.imag_step = torch.compile(self._imag_step, **self.pi_compile)
-        self.reward_term = torch.compile(self._reward_term, **self.pi_compile)
-        self.critic_input_c = torch.compile(self._critic_input, **self.pi_compile)
+        self.wm_err = self.compile_fn(self._wm_err, **self.wm_compile)
+        self.imag_step = self.compile_fn(self._imag_step, **self.pi_compile)
+        self.reward_term = self.compile_fn(self._reward_term, **self.pi_compile)
+        self.critic_input_c = self.compile_fn(self._critic_input, **self.pi_compile)
         # optional (train.py --pi_encode_once; XMimic's --imag_hoist and --pi_deferred_grads, algos.xmimic): an imagined
         # step's goal depends on its reference frame only, so the policy's goal encoder runs once over every step's goal and
         # the steps run its decoder; with --imag_hoist the steps compute only what depends on the imagined state; with
@@ -98,9 +98,9 @@ class SuperMimic(Algo):
         if self.encode_once:
             if self.pi_rollout_clip > 0:
                 raise ValueError("--pi_encode_once: not with --pi_rollout_clip (its rerun of the policy reads every step's goal)")
-            self.encode_goals = torch.compile(self._encode_goals, **self.pi_compile)
-            self.imag_step_z = torch.compile(self._imag_step_z, **self.pi_compile)
-            self.imag_step_h = torch.compile(self._imag_step_h, **self.pi_compile)
+            self.encode_goals = self.compile_fn(self._encode_goals, **self.pi_compile)
+            self.imag_step_z = self.compile_fn(self._imag_step_z, **self.pi_compile)
+            self.imag_step_h = self.compile_fn(self._imag_step_h, **self.pi_compile)
         if self.pi_graphs:
             self.mark_static_tensors()
 

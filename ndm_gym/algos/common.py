@@ -289,6 +289,15 @@ class Algo:
         self.mirror = Mirror(dev) if getattr(args, "wm_mirror", 0.0) > 0 else None
         if getattr(args, "wm_structured", False) and not getattr(self.wm, "structured", False):
             raise ValueError("--wm_structured: SuperMimic's MLP world model only")
+        # Optional (train.py --no_compile): keep learner functions eager. This
+        # preserves the mathematical operations while avoiding first-run
+        # Inductor/PTX compilation during development and short diagnostics.
+        self.no_compile = getattr(args, "no_compile", False)
+        self.compile_fn = (
+            (lambda function, **kwargs: function)
+            if self.no_compile
+            else torch.compile
+        )
         # optional (train.py --wm_cudagraphs, --pi_cudagraphs): the world-model update's and the policy update's compiled
         # functions replayed as CUDA graphs
         self.wm_graphs = getattr(args, "wm_cudagraphs", False)
@@ -297,8 +306,8 @@ class Algo:
         self.pi_compile = {"mode": "reduce-overhead"} if self.pi_graphs else {}
         # a Transformer's k-step rollout is one large graph (~10 min to compile): compile its step instead (~2 min)
         rf = args.wm_backbone == "rigidformer"
-        self.wm_step = torch.compile(self.wm.step, **self.wm_compile) if rf else self.wm.step
-        self.wm_rollout = self._wm_rollout if rf else torch.compile(self._wm_rollout, **self.wm_compile)
+        self.wm_step = self.compile_fn(self.wm.step, **self.wm_compile) if rf else self.wm.step
+        self.wm_rollout = self._wm_rollout if rf else self.compile_fn(self._wm_rollout, **self.wm_compile)
         # optional (train.py --wm_deferred_grads, --deferred_bf16; XMimic, algos.xmimic): the fit's gradients of the MLP's
         # Linear layers as one product per layer over the window's steps, formed after the backward pass
         self.wm_deferred = getattr(args, "wm_deferred_grads", False)
@@ -306,10 +315,10 @@ class Algo:
         if self.wm_deferred:
             if rf:
                 raise ValueError("--wm_deferred_grads: the MLP world model only")
-            self.wm_rollout_deferred = torch.compile(self._wm_rollout_deferred, **self.wm_compile)
+            self.wm_rollout_deferred = self.compile_fn(self._wm_rollout_deferred, **self.wm_compile)
         # optional trick (--wm_smooth_w): the world model's network penalized for steep changes about the replay's inputs
         self.smooth_w = check_smoothness_args(args)
-        self.wm_smoothness = torch.compile(self._wm_smoothness, **self.wm_compile)
+        self.wm_smoothness = self.compile_fn(self._wm_smoothness, **self.wm_compile)
         # optional trick (--bptt_decay): the policy's BPTT gradient through the imagined states decays by lam per step
         self.bptt_decay = getattr(args, "bptt_decay", 1.0)
         if not 0 < self.bptt_decay <= 1:
@@ -321,7 +330,7 @@ class Algo:
         # optional (train.py --compile_eager): the input features the world model's normalizer is fit on, of every collected
         # transition, as a compiled function (eagerly, the RigidFormer's forward kinematics are hundreds of small launches)
         self.compile_eager = getattr(args, "compile_eager", False)
-        self.norm_inputs = torch.compile(self.wm.inputs) if self.compile_eager else self.wm.inputs
+        self.norm_inputs = self.compile_fn(self.wm.inputs) if self.compile_eager else self.wm.inputs
         self.fail_starts = 0
 
     def optimizer_kw(self, lr: float) -> dict:

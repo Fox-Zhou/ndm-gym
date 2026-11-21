@@ -123,6 +123,7 @@ def _args():
         bptt_decay=1.0,
         pi_rollout_clip=0.0,
         compile_eager=False,
+        no_compile=False,
         wm_window=2,
         wm_batch=4,
         pi_batch=4,
@@ -246,6 +247,28 @@ def test_official_supermimic_builds_critic_for_generic_character(monkeypatch):
     assert learner.critic.net[0].in_features == (
         mdp.critic_feature_dim + reference.goal_frame_dim * 2
     )
+
+
+def test_official_supermimic_can_run_without_torch_compile(monkeypatch):
+    def forbidden_compile(*args, **kwargs):
+        raise AssertionError("torch.compile must not run with --no_compile")
+
+    monkeypatch.setattr(torch, "compile", forbidden_compile)
+    spec = ArticulationSpec(
+        joint_names=("j0", "j1", "j2"),
+        tracked_bodies=("root", "foot"),
+        foot_bodies=("foot",),
+        root_body="root",
+    )
+    reference = _Reference()
+    mdp = ArticulationTrackingMDP(
+        spec, _Kinematics(), reference, torch.zeros(3)
+    )
+    args = _args()
+    args.no_compile = True
+    learner = SuperMimic(args, mdp.kin, reference, mdp, "cpu")
+    assert learner.no_compile
+    assert learner.wm_rollout.__func__ is learner._wm_rollout.__func__
 
 
 def test_generic_character_residual_setpoint_uses_reference_and_limits(monkeypatch):
