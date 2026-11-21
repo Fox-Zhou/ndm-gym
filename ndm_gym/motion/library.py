@@ -18,8 +18,24 @@ class MotionLib:
     goal_table: torch.Tensor | None = None  # train.py --goal_table: every frame's goal (cache_goals), of goal_table_K frames
     goal_table_K = 0
 
-    def __init__(self, clips: list[Clip], kin: ArticulationKinematics, device: str):
+    def __init__(
+        self,
+        clips: list[Clip],
+        kin: ArticulationKinematics,
+        device: str,
+        *,
+        cache_body_state: bool = True,
+    ):
+        """Build a device-resident motion library.
+
+        ``cache_body_state`` keeps the FK result for every reference frame.  It
+        is useful only when the downstream task reads it through
+        :meth:`ref_body_state`; otherwise it wastes memory.  When disabled,
+        :meth:`ref_body_state` runs the same FK on the requested device batch.
+        The default preserves the original G1 and evaluation behaviour.
+        """
         self.device = device
+        self.kin = kin
         self.names = [c.name for c in clips]
         self.meta = [c.meta for c in clips]  # each clip's source description, if its loader gives one
         objects = {c.obj_name for c in clips}
@@ -107,13 +123,27 @@ class MotionLib:
         self.root_p, self.root_R, self.root_v, self.root_w = cat(root_p), cat(root_R), cat(root_v), cat(root_w)
         self.q, self.qd = cat(jq), cat(jqd)
         self.goal_frame_dim = 15 + 2 * self.q.shape[-1]
-        with torch.no_grad():
-            bp, bR, bv, bw = [], [], [], []
-            for s in range(0, self.num_frames, 65536):
-                e = min(s + 65536, self.num_frames)
-                out = kin.forward(self.root_p[s:e], self.root_R[s:e], self.root_v[s:e], self.root_w[s:e], self.q[s:e], self.qd[s:e])
-                bp.append(out[0]), bR.append(out[1]), bv.append(out[2]), bw.append(out[3])
-            self.body_p, self.body_R, self.body_v, self.body_w = torch.cat(bp), torch.cat(bR), torch.cat(bv), torch.cat(bw)
+        self.body_p = self.body_R = self.body_v = self.body_w = None
+        if cache_body_state:
+            with torch.no_grad():
+                bp, bR, bv, bw = [], [], [], []
+                for s in range(0, self.num_frames, 65536):
+                    e = min(s + 65536, self.num_frames)
+                    out = kin.forward(
+                        self.root_p[s:e],
+                        self.root_R[s:e],
+                        self.root_v[s:e],
+                        self.root_w[s:e],
+                        self.q[s:e],
+                        self.qd[s:e],
+                    )
+                    bp.append(out[0]), bR.append(out[1]), bv.append(out[2]), bw.append(out[3])
+                self.body_p, self.body_R, self.body_v, self.body_w = (
+                    torch.cat(bp),
+                    torch.cat(bR),
+                    torch.cat(bv),
+                    torch.cat(bw),
+                )
         if self.has_object:
             self.obj_p = cat(ops)
             self.obj_R = cat([quat_to_mat(q) for q in oqs])
@@ -205,6 +235,22 @@ class MotionLib:
 
     def ref_state(self, f: torch.Tensor):
         return self.root_p[f], self.root_R[f], self.root_v[f], self.root_w[f], self.q[f], self.qd[f]
+
+    def ref_body_state(self, f: torch.Tensor, state=None):
+        """Reference body FK at ``f``, from the full-library cache or on demand.
+
+        Both paths run on ``self.device``.  In cache mode no FK is repeated at
+        training time; in on-demand mode no full-library body tensors exist.
+        """
+        if self.body_p is None:
+            return self.kin.forward(*(self.ref_state(f) if state is None else state))
+        return self.body_p[f], self.body_R[f], self.body_v[f], self.body_w[f]
+
+    def ref_body_positions(self, f: torch.Tensor, state=None):
+        """Reference body positions without reading unused cached components."""
+        if self.body_p is None:
+            return self.kin.forward(*(self.ref_state(f) if state is None else state))[0]
+        return self.body_p[f]
 
     def ref_object(self, f: torch.Tensor):
         """The object's reference state at frames f: position, rotation matrix, world linear and angular velocity."""

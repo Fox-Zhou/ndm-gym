@@ -24,6 +24,12 @@ class DynamicReference(Protocol):
 
     def ref_state(self, frames: torch.Tensor) -> tuple[torch.Tensor, ...]: ...
 
+    def ref_body_state(
+        self, frames: torch.Tensor, state=None
+    ) -> tuple[torch.Tensor, ...]: ...
+
+    def ref_body_positions(self, frames: torch.Tensor, state=None) -> torch.Tensor: ...
+
 
 @dataclass
 class ArticulationRewardCfg:
@@ -128,7 +134,9 @@ class ArticulationTrackingMDP:
         p, R, v, w, q, qd = state
         bp, bR, bv, bw = self.kin.forward(p, R, v, w, q, qd)
         rp, rR, rv, rw, rq, rqd = ref.ref_state(frames)
-        rbp, rbR, rbv, rbw = self.kin.forward(rp, rR, rv, rw, rq, rqd)
+        rbp, rbR, rbv, rbw = ref.ref_body_state(
+            frames, (rp, rR, rv, rw, rq, rqd)
+        )
         # Match NDM's root-anchored body pose reward while preserving world-space
         # root terms. Reference velocities remain in world coordinates.
         dR = yaw_mat(R @ rR.transpose(-1, -2))
@@ -202,9 +210,9 @@ class ArticulationTrackingMDP:
         p, rotation, _, _, q, _ = state
         heading_t = yaw_mat(rotation).transpose(-1, -2)
         rp, rR, rv, rw, rq, rqd = ref.ref_state(frames)
-        del rv, rw, rqd
         body_position = self.kin.forward(*state)[0]
-        rbp = self.kin.forward(rp, rR, *ref.ref_state(frames)[2:])[0]
+        rbp = ref.ref_body_positions(frames, (rp, rR, rv, rw, rq, rqd))
+        del rv, rw, rqd
         delta_rotation = yaw_mat(rotation @ rR.transpose(-1, -2))
         anchor = torch.cat((p[..., :2], rp[..., 2:3]), -1)
         reference_body = anchor.unsqueeze(-2) + (

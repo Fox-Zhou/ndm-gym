@@ -132,6 +132,9 @@ def add_train_args(parser: argparse.ArgumentParser):
     parser.add_argument("--smpl_usd", type=str, default="/ALG/zhouyangchen/human_template/character/phc_smpl/phc_smpl.usda")
     parser.add_argument("--max_clips", type=int, default=None,
                         help="optional SMPL data-loading limit for smoke tests")
+    parser.add_argument("--reference_body_cache", action="store_true",
+                        help="SMPL only: precompute full-library reference body FK and have reward/critic index it; "
+                             "without this flag, reward/critic compute reference FK for each GPU batch")
     parser.add_argument("--paired", action="store_true",
                         help="the two-robot scene: each env's two G1s track the two sides of a two-person clip "
                         "(--num_envs counts robots)")  # fmt: skip
@@ -284,6 +287,8 @@ def parse_args():
             )
     elif args.motions == "bonesseed_smpl":
         parser.error("--motions bonesseed_smpl needs --character smpl")
+    elif args.reference_body_cache:
+        parser.error("--reference_body_cache is only defined for --character smpl")
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
     if world_size > 1:
         if args.algo != "supermimic":
@@ -487,7 +492,14 @@ def main():
         if distributed.is_main():
             with open(os.path.join(args.log_dir, "clips.txt"), "w") as f:  # the clips trained on, whatever the list file says later
                 f.write("".join(f"{c.name}\n" for c in clips))
-    motion = MotionLib(clips, kin, dev)
+    motion = MotionLib(
+        clips,
+        kin,
+        dev,
+        cache_body_state=(
+            args.reference_body_cache if args.character == "smpl" else True
+        ),
+    )
     if args.character == "smpl":
         reward_cfg = ArticulationRewardCfg()
         if args.reward_std_scale != 1.0:

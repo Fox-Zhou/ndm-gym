@@ -39,7 +39,11 @@ class _Kinematics:
     q_lo = torch.full((3,), -1.0)
     q_hi = torch.full((3,), 1.0)
 
+    def __init__(self):
+        self.forward_calls = 0
+
     def forward(self, p, rotation, v, w, q, qd):
+        self.forward_calls += 1
         batch = p.shape[:-1]
         body_p = p.unsqueeze(-2).expand(*batch, 2, 3)
         body_rotation = rotation.unsqueeze(-3).expand(*batch, 2, 3, 3)
@@ -71,6 +75,20 @@ class _Reference:
             self.q[frames],
             self.qd[frames],
         )
+
+    def ref_body_state(self, frames, state=None):
+        state = self.ref_state(frames) if state is None else state
+        p, rotation, v, w = state[:4]
+        batch = p.shape[:-1]
+        return (
+            p.unsqueeze(-2).expand(*batch, 2, 3),
+            rotation.unsqueeze(-3).expand(*batch, 2, 3, 3),
+            v.unsqueeze(-2).expand(*batch, 2, 3),
+            w.unsqueeze(-2).expand(*batch, 2, 3),
+        )
+
+    def ref_body_positions(self, frames, state=None):
+        return self.ref_body_state(frames, state)[0]
 
     def goal(self, frames, count):
         return torch.zeros(len(frames), count * self.goal_frame_dim)
@@ -126,6 +144,68 @@ def _args():
         imag_hoist=False,
         pi_deferred_grads=False,
     )
+
+
+def test_reference_body_cache_is_used_instead_of_recomputed():
+    from ndm_gym.motion.library import MotionLib
+    from ndm_gym.motion.sources import Clip
+
+    frames = torch.tensor([0, 2, 4])
+    root_p = torch.zeros(6, 3)
+    root_p[:, 2] = 1.0
+    clip = Clip(
+        name="reference_cache",
+        root_p=root_p,
+        root_quat=torch.tensor([[1.0, 0.0, 0.0, 0.0]]).expand(6, -1).clone(),
+        joints=torch.zeros(6, 3),
+        fps=50.0,
+    )
+
+    cached_kin = _Kinematics()
+    cached = MotionLib([clip], cached_kin, "cpu", cache_body_state=True)
+    cached_kin.forward_calls = 0
+    cached_state = cached.ref_body_state(frames)
+    assert cached_kin.forward_calls == 0
+    assert cached.body_p is not None
+
+    dynamic_kin = _Kinematics()
+    dynamic = MotionLib([clip], dynamic_kin, "cpu", cache_body_state=False)
+    dynamic_kin.forward_calls = 0
+    dynamic_state = dynamic.ref_body_state(frames)
+    assert dynamic_kin.forward_calls == 1
+    assert dynamic.body_p is None
+
+    for cached_value, dynamic_value in zip(cached_state, dynamic_state):
+        torch.testing.assert_close(cached_value, dynamic_value, rtol=0, atol=0)
+
+    spec = ArticulationSpec(
+        joint_names=("j0", "j1", "j2"),
+        tracked_bodies=("root", "foot"),
+        foot_bodies=("foot",),
+        root_body="root",
+    )
+    action = torch.zeros(len(frames), spec.action_dim)
+    context = torch.zeros(len(frames), spec.context_dim)
+    cached_mdp = ArticulationTrackingMDP(spec, cached_kin, cached, torch.zeros(3))
+    dynamic_mdp = ArticulationTrackingMDP(spec, dynamic_kin, dynamic, torch.zeros(3))
+
+    cached_kin.forward_calls = 0
+    cached_reward = cached_mdp.reward(cached.ref_state(frames), frames, action, action)
+    cached_critic = cached_mdp.critic_features(
+        cached.ref_state(frames), frames, context
+    )
+    assert cached_kin.forward_calls == 2  # Current state only, reward + critic.
+
+    dynamic_kin.forward_calls = 0
+    dynamic_reward = dynamic_mdp.reward(
+        dynamic.ref_state(frames), frames, action, action
+    )
+    dynamic_critic = dynamic_mdp.critic_features(
+        dynamic.ref_state(frames), frames, context
+    )
+    assert dynamic_kin.forward_calls == 4  # Current and reference, both calls.
+    torch.testing.assert_close(cached_reward, dynamic_reward, rtol=0, atol=0)
+    torch.testing.assert_close(cached_critic, dynamic_critic, rtol=0, atol=0)
 
 
 def test_official_supermimic_builds_critic_for_generic_character(monkeypatch):
