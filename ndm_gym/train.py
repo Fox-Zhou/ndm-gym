@@ -281,10 +281,6 @@ def parse_args():
             )
         if args.eprobe_share > 0:
             parser.error("SMPL evaluation-guided reset probes are not implemented yet")
-        if args.sm_residual:
-            parser.error(
-                "SMPL SuperMimic currently uses absolute joint setpoints"
-            )
     elif args.motions == "bonesseed_smpl":
         parser.error("--motions bonesseed_smpl needs --character smpl")
     elif args.reference_body_cache:

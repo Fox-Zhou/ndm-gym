@@ -65,6 +65,11 @@ class ArticulationTrackingMDP:
             raise ValueError("control_dt must be positive")
         self.spec, self.kin, self.reference = spec, kin, reference
         self.default_q, self.control_dt = default_q, float(control_dt)
+        # The SMPL simulator consumes joint targets directly in radians.  In
+        # residual-action mode a unit policy offset is therefore one radian,
+        # and the reference setpoint is simply the reference joint pose.  The
+        # G1 path has its own motor-derived normalized action scale.
+        self.action_scale = torch.ones_like(default_q)
         self.cfg = cfg or ArticulationRewardCfg()
         self.state_codec = ArticulationStateCodec(spec.num_joints)
         self.unflatten_state = self.state_codec.unflatten
@@ -90,6 +95,16 @@ class ArticulationTrackingMDP:
         mid, half = (kin.q_lo + kin.q_hi) / 2, (kin.q_hi - kin.q_lo) / 2
         self.soft_lo = mid - half * self.cfg.soft_limit_factor
         self.soft_hi = mid + half * self.cfg.soft_limit_factor
+
+    def clamp_action(self, action: torch.Tensor) -> torch.Tensor:
+        """Clamp a joint target to the simulator's authoritative limits.
+
+        Collection already applies this clamp at the simulator boundary.  The
+        same operation in imagined rollouts prevents the learned world model
+        from being queried on actions outside its replay-data support.
+        """
+
+        return torch.clamp(action, self.kin.q_lo, self.kin.q_hi)
 
     def observation(self, state, previous_action, frames):
         p, R, _, w, q, qd = state

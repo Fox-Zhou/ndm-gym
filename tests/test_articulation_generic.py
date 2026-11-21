@@ -246,6 +246,30 @@ def test_official_supermimic_builds_critic_for_generic_character(monkeypatch):
     )
 
 
+def test_generic_character_residual_setpoint_uses_reference_and_limits(monkeypatch):
+    monkeypatch.setattr(torch, "compile", lambda function, **kwargs: function)
+    spec = ArticulationSpec(
+        joint_names=("j0", "j1", "j2"),
+        tracked_bodies=("root", "foot"),
+        foot_bodies=("foot",),
+        root_body="root",
+    )
+    reference = _Reference()
+    reference.q[1] = torch.tensor((0.25, -0.5, 0.75))
+    mdp = ArticulationTrackingMDP(
+        spec, _Kinematics(), reference, torch.zeros(3)
+    )
+    args = _args()
+    args.sm_residual = True
+    learner = SuperMimic(args, mdp.kin, reference, mdp, "cpu")
+
+    assert torch.equal(mdp.action_scale, torch.ones(3))
+    frames = torch.tensor((0, 0))
+    offsets = torch.tensor(((0.1, 0.2, -0.3), (2.0, -2.0, 2.0)))
+    expected = torch.clamp(offsets + reference.q[1], -1.0, 1.0)
+    torch.testing.assert_close(learner.setpoint(offsets, frames), expected)
+
+
 def test_official_supermimic_runs_full_generic_updates(monkeypatch):
     from ndm_gym.buffer import ReplayBuffer, articulation_fields
 

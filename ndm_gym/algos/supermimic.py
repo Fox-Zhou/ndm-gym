@@ -114,7 +114,9 @@ class SuperMimic(Algo):
         return a.get("sm_residual", False)
 
     def setpoint(self, a, f):
-        return a + self.ref_u[f + 1] if self.residual else a
+        target = a + self.ref_u[f + 1] if self.residual else a
+        clamp = getattr(self.mdp, "clamp_action", None)
+        return clamp(target) if clamp is not None else target
 
     @property
     def optimizers(self):
@@ -343,8 +345,16 @@ class SuperMimic(Algo):
                         self.opt_v.zero_grad(set_to_none=True)
                         v_loss.backward()
                         distributed.average_gradients(self.critic.parameters())
-                        nn.utils.clip_grad_norm_(self.critic.parameters(), 1.0)
-                        self.opt_v.step()
+                        gn_v = nn.utils.clip_grad_norm_(self.critic.parameters(), 1.0)
+                        finite = torch.isfinite(v_loss) & torch.isfinite(gn_v)
+                        if self.opt_v.defaults.get("fused", False):
+                            # Keep this branch device-side: fused Adam accepts
+                            # found_inf and leaves parameters and optimizer
+                            # state untouched when this minibatch is invalid.
+                            zero_nonfinite_grads(self.critic.parameters(), finite)
+                            self.optimizer_step(self.opt_v, finite)
+                        elif bool(finite):
+                            self.opt_v.step()
         if PROFILE:
             torch.cuda.synchronize()
             print(f"[prof] imagine fwd {1e3*(tq1-tq0):.0f} ms | bwd {1e3*(tq2-tq1):.0f} ms | critic {1e3*(time.time()-tq2):.0f} ms", flush=True)
