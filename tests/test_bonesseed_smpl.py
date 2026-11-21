@@ -71,6 +71,17 @@ def test_json_result_list_filters_before_sharding(tmp_path):
     ]
 
 
+def test_selected_shard_only_requires_its_own_files(tmp_path):
+    _write_motion(tmp_path, "motion_00")
+    _write_motion(tmp_path, "motion_02")
+    clips = bonesseed_smpl.load_dir(
+        tmp_path,
+        names=["motion_00", "motion_01_missing", "motion_02"],
+        shard=(0, 2),
+    )
+    assert [clip.name for clip in clips] == ["motion_00", "motion_02"]
+
+
 @pytest.mark.parametrize("shard", [(-1, 2), (2, 2), (0, 0)])
 def test_invalid_shard_is_rejected(tmp_path, shard):
     _write_motion(tmp_path, "motion")

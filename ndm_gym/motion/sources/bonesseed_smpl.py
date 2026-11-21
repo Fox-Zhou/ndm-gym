@@ -64,30 +64,31 @@ def load_dir(
     clips afterwards.
     """
     root = Path(path).expanduser().resolve()
-    files = sorted(glob.glob(str(root / "**" / "motion.npz"), recursive=True))
-    if names is not None:
-        keep = set(names)
-        available = {
-            Path(file).parent.relative_to(root).as_posix() for file in files
-        }
-        missing = sorted(keep - available)
-        if missing:
-            preview = missing[:10]
-            raise ValueError(
-                f"{len(missing)} selected SMPL clips are missing under {root}: {preview}"
-            )
-        files = [
-            file
-            for file in files
-            if Path(file).parent.relative_to(root).as_posix() in keep
-        ]
-    if max_clips is not None:
-        files = files[:max_clips]
+    selected_names = sorted(names) if names is not None else None
+    if selected_names is None:
+        files = sorted(glob.glob(str(root / "**" / "motion.npz"), recursive=True))
+        if max_clips is not None:
+            files = files[:max_clips]
+    else:
+        if max_clips is not None:
+            selected_names = selected_names[:max_clips]
+        files = [str(root / name / "motion.npz") for name in selected_names]
     if shard is not None:
         index, count = shard
         if count < 1 or not 0 <= index < count:
             raise ValueError(f"invalid motion shard {index}/{count}")
         files = files[index::count]
+    if selected_names is not None:
+        missing = [
+            Path(file).parent.relative_to(root).as_posix()
+            for file in files
+            if not Path(file).is_file()
+        ]
+        if missing:
+            raise ValueError(
+                f"{len(missing)} selected SMPL clips are missing under {root}: "
+                f"{missing[:10]}"
+            )
     if not files:
         raise FileNotFoundError(
             f"no converted SMPL-character motions (motion.npz) under {root}"
