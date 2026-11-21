@@ -212,9 +212,6 @@ def add_speed_args(parser: argparse.ArgumentParser, rigidformer: bool = True):
     parser.add_argument("--compile_eager", action="store_true",
                         help="compile the forward kinematics that otherwise run eagerly: the collection's reward and world-model normalizer "
                              "features, supermimic's critic input in the policy loss (hundreds of small launches each; changes results by rounding)")
-    parser.add_argument("--no_compile", action="store_true",
-                        help="run learner functions eagerly instead of torch.compile (same computations up to floating-point rounding; "
-                             "avoids long first-run Inductor/PTX compilation at the cost of steady-state throughput)")
     parser.add_argument("--goal_table", action="store_true",
                         help="the policy's goal of every reference frame computed once (MotionLib.cache_goals) and read in collection and in "
                              "every imagined step (equal up to rounding; 1.2 GB for LAFAN1)")
@@ -261,21 +258,6 @@ def parse_args():
         parser.error("--critic_cudagraphs: only SuperMimic's critic step has a CUDA graph")
     if args.pi_encode_once and args.algo not in ("supertrack", "supermimic"):
         parser.error("--pi_encode_once: SuperTrack's and SuperMimic's imagination only")
-    if args.no_compile:
-        compile_only = {
-            "--wm_cudagraphs": args.wm_cudagraphs,
-            "--pi_cudagraphs": args.pi_cudagraphs,
-            "--critic_cudagraphs": args.critic_cudagraphs,
-            "--compile_eager": args.compile_eager,
-            "--combo_kernels": args.combo_kernels,
-            "--elementwise_3x3": args.elementwise_3x3,
-        }
-        enabled = [name for name, value in compile_only.items() if value]
-        if enabled:
-            parser.error(
-                "--no_compile cannot be combined with compile-only options: "
-                + ", ".join(enabled)
-            )
     if args.paired and (args.motions != "interhuman" or args.num_envs % 2):
         parser.error("--paired: two-person clips (--motions interhuman) and an even --num_envs (two robots per env)")
     if args.character == "smpl":
