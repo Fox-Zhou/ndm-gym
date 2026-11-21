@@ -10,6 +10,7 @@ require_simulator(__name__)
 
 import torch
 from isaaclab_newton.physics import MJWarpSolverCfg, NewtonCfg
+from mujoco_warp._src.types import OverflowType
 
 import isaaclab.sim as sim_utils
 from isaaclab.actuators import ImplicitActuatorCfg
@@ -141,6 +142,16 @@ class SMPLTrackingSim:
             )
         )
         self.sim.reset()
+        # Hitting MuJoCo-Warp's Newton/line-search iteration cap is recorded in
+        # the per-world overflow bits and the step uses the best iterate, just
+        # as native MuJoCo does.  Printing one warning per affected world from
+        # a GPU kernel creates tens of gigabytes of duplicate logs in a large
+        # training run, so disable only those two print bits.  The limits,
+        # solver path and recorded overflow state remain unchanged.
+        model = self.sim.backend_manager.get_model()
+        model.opt.warn_overflow = int(model.opt.warn_overflow) & ~int(
+            OverflowType.ITERATIONS | OverflowType.LS_ITERATIONS
+        )
         self.robot = self.scene["robot"]
         sim_names = tuple(self.robot.joint_names)
         if set(sim_names) != set(FORMAL_SIM_JOINT_NAMES):
