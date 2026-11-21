@@ -48,6 +48,29 @@ def test_max_clips_is_a_global_limit_before_sharding(tmp_path):
     assert [len(shard) for shard in shards] == [3, 2]
 
 
+def test_json_result_list_filters_before_sharding(tmp_path):
+    import json
+
+    for index in range(7):
+        _write_motion(tmp_path, f"day/motion_{index:02d}")
+    selected = [
+        "day/motion_01/result.npz",
+        "day/motion_03/result.npz",
+        "day/motion_06/result.npz",
+    ]
+    manifest = tmp_path / "selected.json"
+    manifest.write_text(json.dumps(selected))
+    names = bonesseed_smpl.read_clip_list(manifest)
+    shards = [
+        bonesseed_smpl.load_dir(tmp_path, names=names, shard=(rank, 2))
+        for rank in range(2)
+    ]
+    assert [[clip.name for clip in shard] for shard in shards] == [
+        ["day/motion_01", "day/motion_06"],
+        ["day/motion_03"],
+    ]
+
+
 @pytest.mark.parametrize("shard", [(-1, 2), (2, 2), (0, 0)])
 def test_invalid_shard_is_rejected(tmp_path, shard):
     _write_motion(tmp_path, "motion")

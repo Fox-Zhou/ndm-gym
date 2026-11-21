@@ -139,7 +139,7 @@ def add_train_args(parser: argparse.ArgumentParser):
                         help="the two-robot scene: each env's two G1s track the two sides of a two-person clip "
                         "(--num_envs counts robots)")  # fmt: skip
     parser.add_argument("--clips", type=str, default=None,
-                        help="train on the clips listed in this file (one name per line) instead of every clip in --motion_dir")  # fmt: skip
+                        help="train on the clips listed in this file instead of every clip in --motion_dir; SMPL accepts text names or a UMR++ JSON manifest")  # fmt: skip
     parser.add_argument("--log_dir", type=str, default=os.path.join(REPO, "logs", "run"))
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--dist_timeout_min", type=int, default=30,
@@ -482,6 +482,7 @@ def main():
         clips = bonesseed_smpl.load_dir(
             args.motion_dir,
             max_clips=args.max_clips,
+            names=(bonesseed_smpl.read_clip_list(args.clips) if args.clips else None),
             shard=motion_shard,
         )
         make_tracking_sim = make_smpl_sim
@@ -496,12 +497,7 @@ def main():
             clips = lafan1.load_dir(args.motion_dir)
         make_tracking_sim = make_sim
         tracking_sim_cls = PairedTrackingSim if args.paired else TrackingSim
-    if args.clips:
-        if args.character == "smpl" and distributed.enabled():
-            raise ValueError(
-                "distributed SMPL training already shards --motion_dir across ranks; "
-                "--clips is not supported with that layout"
-            )
+    if args.clips and args.character != "smpl":
         clips = select(clips, read_clip_list(args.clips))
     if args.character == "smpl" and distributed.enabled():
         with open(

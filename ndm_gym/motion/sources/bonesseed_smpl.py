@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import glob
+import json
 from pathlib import Path
 
 import numpy as np
@@ -11,10 +12,48 @@ import torch
 from . import Clip
 
 
+def _clip_name(value: str) -> str:
+    name = value.strip().replace("\\", "/").lstrip("./")
+    for suffix in ("/result.npz", "/motion.npz"):
+        if name.endswith(suffix):
+            name = name[: -len(suffix)]
+    return name.rstrip("/")
+
+
+def read_clip_list(path: str | Path) -> list[str]:
+    """Read converted clip names from text or a UMR++ JSON manifest."""
+    source = Path(path)
+    if source.suffix.lower() == ".json":
+        raw = json.loads(source.read_text())
+        if isinstance(raw, dict):
+            raw = raw.get("motions", raw.get("items"))
+        if not isinstance(raw, list):
+            raise ValueError("SMPL JSON clip list must be a list or contain motions/items")
+        values = []
+        for item in raw:
+            if isinstance(item, dict):
+                item = item.get("path") or item.get("output_dir") or item.get("result")
+                if item is None:
+                    raise ValueError("SMPL JSON clip-list item has no path/output_dir/result")
+            values.append(str(item))
+    else:
+        values = [
+            line.split("#", 1)[0].strip()
+            for line in source.read_text().splitlines()
+        ]
+    names = [_clip_name(value) for value in values if value.strip()]
+    if not names:
+        raise ValueError(f"{source} lists no clips")
+    if len(set(names)) != len(names):
+        raise ValueError(f"{source} lists a clip more than once")
+    return names
+
+
 def load_dir(
     path: str | Path,
     max_clips: int | None = None,
     *,
+    names: list[str] | None = None,
     shard: tuple[int, int] | None = None,
 ) -> list[Clip]:
     """Load converted SMPL clips, optionally taking one deterministic shard.
@@ -26,6 +65,22 @@ def load_dir(
     """
     root = Path(path).expanduser().resolve()
     files = sorted(glob.glob(str(root / "**" / "motion.npz"), recursive=True))
+    if names is not None:
+        keep = set(names)
+        available = {
+            Path(file).parent.relative_to(root).as_posix() for file in files
+        }
+        missing = sorted(keep - available)
+        if missing:
+            preview = missing[:10]
+            raise ValueError(
+                f"{len(missing)} selected SMPL clips are missing under {root}: {preview}"
+            )
+        files = [
+            file
+            for file in files
+            if Path(file).parent.relative_to(root).as_posix() in keep
+        ]
     if max_clips is not None:
         files = files[:max_clips]
     if shard is not None:
