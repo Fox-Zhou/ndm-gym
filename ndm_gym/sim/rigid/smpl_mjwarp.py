@@ -219,7 +219,17 @@ class SMPLTrackingSim:
         """Paper Appendix D.1 return-based reset sampling over one-second bins."""
 
         motion = self.motion
-        soft = torch.softmax(-25.0 * self.bin_G / self.G_max, 0)
+        # A physics divergence is handled as a terminated episode in step(),
+        # but keep the adaptive reset distribution defensive as well: one
+        # invalid return must never make multinomial sampling unusable.
+        safe_bin_G = torch.nan_to_num(
+            self.bin_G, nan=0.0, posinf=self.G_max, neginf=-self.G_max
+        )
+        soft = torch.softmax(-25.0 * safe_bin_G / self.G_max, 0)
+        self.bin_w_avg.copy_(
+            torch.nan_to_num(self.bin_w_avg, nan=0.0, posinf=0.0, neginf=0.0)
+            .clamp_min_(0.0)
+        )
         self.bin_w_avg.mul_(0.999).add_(0.001 * soft)
         probability = (
             0.5 / motion.num_bins
@@ -230,6 +240,15 @@ class SMPLTrackingSim:
             probability = mix_failures(
                 probability, self.bin_fail, self.bin_prev, self.fail_reset
             )
+        probability = torch.nan_to_num(
+            probability, nan=0.0, posinf=0.0, neginf=0.0
+        ).clamp_min_(0.0)
+        total = probability.sum()
+        probability = torch.where(
+            total > 0,
+            probability / total.clamp_min(1e-12),
+            torch.full_like(probability, 1.0 / motion.num_bins),
+        )
         bins = torch.multinomial(probability, count, replacement=True)
         start = motion.bin_start[bins]
         last = motion.clip_end[motion.bin_clip[bins]]
@@ -325,9 +344,29 @@ class SMPLTrackingSim:
         self.scene.update(CONTROL_DT)
         next_state = self.state()
         next_frames = frames + 1
-        reward, terms = self.mdp.reward(
-            next_state, next_frames, action, previous, terms=True
+        finite = torch.stack(
+            [value.flatten(1).isfinite().all(-1) for value in next_state]
+        ).all(0)
+        # Reward/FK and replay see a finite fallback for diverged worlds.  The
+        # corresponding transition is still marked terminated below, reset in
+        # this same control step, and contributes zero reward.
+        safe_state = tuple(torch.nan_to_num(value) for value in state)
+        safe_next_state = tuple(
+            torch.where(
+                finite.view((-1,) + (1,) * (value.ndim - 1)),
+                value,
+                fallback,
+            )
+            for value, fallback in zip(next_state, safe_state)
         )
+        reward, terms = self.mdp.reward(
+            safe_next_state, next_frames, action, previous, terms=True
+        )
+        reward = torch.where(finite & reward.isfinite(), reward, 0.0)
+        terms = {
+            name: torch.where(finite & value.isfinite(), value, 0.0)
+            for name, value in terms.items()
+        }
         terminated = self.mdp.termination(next_state, next_frames)
         clip_end = self.motion.clip_end[self.motion.clip_id[frames]]
         timed_out = (next_frames >= clip_end) | (
@@ -335,8 +374,8 @@ class SMPLTrackingSim:
         )
         done = terminated | timed_out
         transition = {
-            "s": flatten_state(state),
-            "s1": flatten_state(next_state),
+            "s": flatten_state(safe_state),
+            "s1": flatten_state(safe_next_state),
             "a": action.clone(),
             "a_prev": previous,
             "f": frames,
@@ -363,6 +402,7 @@ class SMPLTrackingSim:
                 / (1 - self.gamma),
             )
             returns = self.ep_disc_ret[ids] + bootstrap
+            returns = torch.where(returns.isfinite(), returns, 0.0)
             bins = self.start_bin[ids]
             if self.bin_fix:
                 self.bin_G.copy_(bin_ema(self.bin_G, bins, returns, 0.8))

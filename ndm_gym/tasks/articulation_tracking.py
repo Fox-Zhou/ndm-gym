@@ -201,7 +201,18 @@ class ArticulationTrackingMDP:
         rp, rR = self.reference.ref_state(frames)[:2]
         e_z = (rp[..., 2] - p[..., 2]).abs()
         e_tilt = (rR[..., 2, 2] - R[..., 2, 2]).abs()
-        return (e_z > self.cfg.term_height) | (e_tilt > self.cfg.term_tilt)
+        # A diverged physics world must terminate immediately.  Comparisons
+        # with NaN are false, so checking only height/tilt would otherwise let
+        # the invalid episode continue and poison the return-based reset
+        # distribution and replay buffer.
+        finite = torch.stack(
+            [value.flatten(1).isfinite().all(-1) for value in state]
+        ).all(0)
+        return (
+            (e_z > self.cfg.term_height)
+            | (e_tilt > self.cfg.term_tilt)
+            | ~finite
+        )
 
     def critic_features(self, state, frames, normalized_context):
         """SuperMimic critic features with dimensions derived from the spec."""

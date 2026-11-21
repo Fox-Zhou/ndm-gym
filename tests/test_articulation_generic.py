@@ -208,6 +208,25 @@ def test_reference_body_cache_is_used_instead_of_recomputed():
     torch.testing.assert_close(cached_critic, dynamic_critic, rtol=0, atol=0)
 
 
+def test_articulation_termination_catches_nonfinite_physics_state():
+    spec = ArticulationSpec(
+        joint_names=("j0", "j1", "j2"),
+        tracked_bodies=("root", "foot"),
+        foot_bodies=("foot",),
+        root_body="root",
+    )
+    reference = _Reference()
+    mdp = ArticulationTrackingMDP(
+        spec, _Kinematics(), reference, torch.zeros(3)
+    )
+    frames = torch.tensor([0, 1])
+    state = list(reference.ref_state(frames))
+    state[4] = state[4].clone()
+    state[4][1, 0] = torch.nan
+
+    assert mdp.termination(tuple(state), frames).tolist() == [False, True]
+
+
 def test_official_supermimic_builds_critic_for_generic_character(monkeypatch):
     monkeypatch.setattr(torch, "compile", lambda function, **kwargs: function)
     spec = ArticulationSpec(
