@@ -474,7 +474,16 @@ def main():
         )
 
         kin = smpl_kinematics(args.smpl_mjcf, dev)
-        clips = bonesseed_smpl.load_dir(args.motion_dir, max_clips=args.max_clips)
+        motion_shard = (
+            (distributed.rank(), distributed.world_size())
+            if distributed.enabled()
+            else None
+        )
+        clips = bonesseed_smpl.load_dir(
+            args.motion_dir,
+            max_clips=args.max_clips,
+            shard=motion_shard,
+        )
         make_tracking_sim = make_smpl_sim
         tracking_sim_cls = SMPLTrackingSim
     else:
@@ -488,10 +497,21 @@ def main():
         make_tracking_sim = make_sim
         tracking_sim_cls = PairedTrackingSim if args.paired else TrackingSim
     if args.clips:
+        if args.character == "smpl" and distributed.enabled():
+            raise ValueError(
+                "distributed SMPL training already shards --motion_dir across ranks; "
+                "--clips is not supported with that layout"
+            )
         clips = select(clips, read_clip_list(args.clips))
-        if distributed.is_main():
-            with open(os.path.join(args.log_dir, "clips.txt"), "w") as f:  # the clips trained on, whatever the list file says later
-                f.write("".join(f"{c.name}\n" for c in clips))
+    if args.character == "smpl" and distributed.enabled():
+        with open(
+            os.path.join(args.log_dir, f"clips_rank{distributed.rank():02d}.txt"),
+            "w",
+        ) as f:
+            f.write("".join(f"{c.name}\n" for c in clips))
+    elif args.clips and distributed.is_main():
+        with open(os.path.join(args.log_dir, "clips.txt"), "w") as f:  # the clips trained on, whatever the list file says later
+            f.write("".join(f"{c.name}\n" for c in clips))
     motion = MotionLib(
         clips,
         kin,
