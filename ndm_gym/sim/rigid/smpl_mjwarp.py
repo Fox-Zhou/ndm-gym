@@ -148,10 +148,12 @@ class SMPLTrackingSim:
         # a GPU kernel creates tens of gigabytes of duplicate logs in a large
         # training run, so disable only those two print bits.  The limits,
         # solver path and recorded overflow state remain unchanged.
-        model = self.sim.backend_manager.get_model()
-        model.opt.warn_overflow = int(model.opt.warn_overflow) & ~int(
-            OverflowType.ITERATIONS | OverflowType.LS_ITERATIONS
-        )
+        solver = self.sim.backend_manager._solver
+        mjw_model = getattr(solver, "mjw_model", None)
+        if mjw_model is not None:
+            mjw_model.opt.warn_overflow = int(mjw_model.opt.warn_overflow) & ~int(
+                OverflowType.ITERATIONS | OverflowType.LS_ITERATIONS
+            )
         self.robot = self.scene["robot"]
         sim_names = tuple(self.robot.joint_names)
         if set(sim_names) != set(FORMAL_SIM_JOINT_NAMES):
