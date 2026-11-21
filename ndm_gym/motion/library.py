@@ -55,12 +55,20 @@ class MotionLib:
         if self.extra_names is not None and not self.has_object:
             raise ValueError("other objects need the interacted object")
         n_extra = 0 if self.extra_names is None else len(self.extra_names)
-        ps, qs, js = [], [], []
+        if len({c.joint_vel is None for c in clips}) > 1:
+            raise ValueError("joint_vel is given for some clips and missing for others")
+        has_joint_vel = clips[0].joint_vel is not None
+        ps, qs, js, jvs = [], [], [], []
         ops, oqs, ojs, cts, eps, eqs = [], [], [], [], [], []
         lens = []
         for c in clips:
             p, quat, j, src_fps = c.root_p, c.root_quat, c.joints, c.fps
             T_src = p.shape[0]
+            if has_joint_vel and c.joint_vel.shape != j.shape:
+                raise ValueError(
+                    f"clip {c.name}: joint_vel {tuple(c.joint_vel.shape)} "
+                    f"does not match joints {tuple(j.shape)}"
+                )
             if n_extra and not c.extra_p.shape[:2] == c.extra_quat.shape[:2] == (T_src, n_extra):
                 raise ValueError(f"clip {c.name}: the other objects' poses must cover every frame")
             if abs(src_fps * CONTROL_DT - 1) < 1e-9:
@@ -69,6 +77,8 @@ class MotionLib:
                 if self.has_object and (c.obj_p is None or c.obj_quat is None or c.obj_p.shape[0] != T_src or c.obj_quat.shape[0] != T_src):
                     raise ValueError(f"clip {c.name}: the object pose must cover every frame")
                 ps.append(p), qs.append(quat), js.append(j)
+                if has_joint_vel:
+                    jvs.append(c.joint_vel)
                 lens.append(T_src)
                 if self.has_object:
                     ops.append(c.obj_p), oqs.append(c.obj_quat)
@@ -89,6 +99,11 @@ class MotionLib:
             j = j[i0] * (1 - a[:, None]) + j[i0 + 1] * a[:, None]
             quat = quat_slerp(quat[i0], quat[i0 + 1], a)
             ps.append(p), qs.append(quat), js.append(j)
+            if has_joint_vel:
+                jvs.append(
+                    c.joint_vel[i0] * (1 - a[:, None])
+                    + c.joint_vel[i0 + 1] * a[:, None]
+                )
             lens.append(n)
             if self.has_object:
                 if c.obj_p is None or c.obj_quat is None or c.obj_p.shape[0] != T_src or c.obj_quat.shape[0] != T_src:
@@ -109,10 +124,10 @@ class MotionLib:
         self.clip_id = torch.cat([torch.full((n,), i, dtype=torch.long) for i, n in enumerate(lens)]).to(device)
 
         root_p, root_R, root_v, root_w, jq, jqd = [], [], [], [], [], []
-        for p, quat, j in zip(ps, qs, js):
+        for index, (p, quat, j) in enumerate(zip(ps, qs, js)):
             R = quat_to_mat(quat)
             v = _gradient(p, CONTROL_DT)
-            qd = _gradient(j, CONTROL_DT)
+            qd = jvs[index] if has_joint_vel else _gradient(j, CONTROL_DT)
             # angular velocity (world) by central differences of rotations
             w = torch.zeros_like(p)
             w[1:-1] = so3_log(R[2:] @ R[:-2].transpose(-1, -2)) / (2 * CONTROL_DT)

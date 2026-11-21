@@ -97,11 +97,26 @@ def load_dir(
     for name in files:
         file = Path(name)
         with np.load(file, allow_pickle=False) as data:
+            schema = str(np.asarray(data["schema"]).item()) if "schema" in data else None
+            if schema == "bonesseed-smpl-character-v1":
+                raise ValueError(
+                    f"{file}: obsolete v1 XYZ-Euler motion; reconvert it with "
+                    "convert_bonesseed_umrpp_to_smpl.py"
+                )
+            if schema not in (None, "bonesseed-smpl-character-v2"):
+                raise ValueError(f"{file}: unsupported schema {schema!r}")
             root_p = torch.from_numpy(np.asarray(data["root_p"], dtype=np.float32).copy())
             root_quat = torch.from_numpy(
                 np.asarray(data["root_quat_wxyz"], dtype=np.float32).copy()
             )
             joints = torch.from_numpy(np.asarray(data["joints"], dtype=np.float32).copy())
+            joint_vel = (
+                torch.from_numpy(
+                    np.asarray(data["joint_vel"], dtype=np.float32).copy()
+                )
+                if "joint_vel" in data
+                else None
+            )
             fps = float(np.asarray(data["fps"]).item())
         if root_p.ndim != 2 or root_p.shape[1] != 3:
             raise ValueError(f"{file}: root_p must be [T,3]")
@@ -109,6 +124,11 @@ def load_dir(
             raise ValueError(f"{file}: root_quat_wxyz must be [T,4]")
         if joints.shape != (root_p.shape[0], 69):
             raise ValueError(f"{file}: joints must be [T,69]")
+        if schema == "bonesseed-smpl-character-v2":
+            if joint_vel is None or joint_vel.shape != joints.shape:
+                raise ValueError(f"{file}: v2 joint_vel must match joints")
+            if abs(fps - 50.0) > 1e-6:
+                raise ValueError(f"{file}: v2 clips must be pre-resampled to 50 Hz")
         if not np.isfinite(fps) or fps <= 0:
             raise ValueError(f"{file}: invalid fps {fps}")
         relative = file.parent.relative_to(root).as_posix()
@@ -120,6 +140,7 @@ def load_dir(
                 joints,
                 fps,
                 meta={"source": str(file)},
+                joint_vel=joint_vel,
             )
         )
     return clips

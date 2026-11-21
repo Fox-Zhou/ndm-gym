@@ -44,6 +44,13 @@ class ArticulationRewardCfg:
     soft_limit_factor: float = 0.9
     term_height: float = 0.25
     term_tilt: float = 0.8
+    # A Newton/MuJoCo-Warp divergence can remain finite for one step.  These
+    # deliberately generous bounds match NDM-Gym's HOI/muscle guards and keep
+    # such a state out of replay before it poisons the world model.
+    state_position_bound: float = 1.0e3
+    state_velocity_bound: float = 1.0e3
+    state_rotation_bound: float = 2.0
+    state_joint_limit_margin: float = 0.5
 
 
 class ArticulationTrackingMDP:
@@ -211,6 +218,31 @@ class ArticulationTrackingMDP:
         )
         return 1 - alive
 
+    def healthy_state(self, state):
+        """Per-environment finite and finite-but-exploded state guard."""
+
+        p, R, v, w, q, qd = state
+        c = self.cfg
+        finite = torch.stack(
+            [value.flatten(1).isfinite().all(-1) for value in state]
+        ).all(0)
+        bounded = (
+            (p.abs() <= c.state_position_bound).all(-1)
+            & (R.abs() <= c.state_rotation_bound).flatten(1).all(-1)
+            & (v.abs() <= c.state_velocity_bound).all(-1)
+            & (w.abs() <= c.state_velocity_bound).all(-1)
+            & (qd.abs() <= c.state_velocity_bound).all(-1)
+            & (
+                q
+                >= self.kin.q_lo - c.state_joint_limit_margin
+            ).all(-1)
+            & (
+                q
+                <= self.kin.q_hi + c.state_joint_limit_margin
+            ).all(-1)
+        )
+        return finite & bounded
+
     def termination(self, state, frames):
         p, R = state[0], state[1]
         rp, rR = self.reference.ref_state(frames)[:2]
@@ -220,13 +252,10 @@ class ArticulationTrackingMDP:
         # with NaN are false, so checking only height/tilt would otherwise let
         # the invalid episode continue and poison the return-based reset
         # distribution and replay buffer.
-        finite = torch.stack(
-            [value.flatten(1).isfinite().all(-1) for value in state]
-        ).all(0)
         return (
             (e_z > self.cfg.term_height)
             | (e_tilt > self.cfg.term_tilt)
-            | ~finite
+            | ~self.healthy_state(state)
         )
 
     def critic_features(self, state, frames, normalized_context):

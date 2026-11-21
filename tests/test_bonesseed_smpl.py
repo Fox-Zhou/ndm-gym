@@ -2,6 +2,7 @@ from pathlib import Path
 
 import numpy as np
 import pytest
+import torch
 
 from ndm_gym.motion.sources import bonesseed_smpl
 
@@ -87,3 +88,36 @@ def test_invalid_shard_is_rejected(tmp_path, shard):
     _write_motion(tmp_path, "motion")
     with pytest.raises(ValueError, match="invalid motion shard"):
         bonesseed_smpl.load_dir(tmp_path, shard=shard)
+
+
+def test_obsolete_euler_schema_is_rejected(tmp_path):
+    _write_motion(tmp_path, "old")
+    path = tmp_path / "old" / "motion.npz"
+    with np.load(path) as data:
+        arrays = {name: data[name] for name in data.files}
+    np.savez(path, schema=np.asarray("bonesseed-smpl-character-v1"), **arrays)
+    with pytest.raises(ValueError, match="obsolete v1 XYZ-Euler motion"):
+        bonesseed_smpl.load_dir(tmp_path)
+
+
+def test_v2_loads_source_authoritative_joint_velocity(tmp_path):
+    from ndm_gym.motion.library import MotionLib
+
+    destination = tmp_path / "new" / "motion.npz"
+    destination.parent.mkdir(parents=True)
+    velocity = np.arange(4 * 69, dtype=np.float32).reshape(4, 69) / 100
+    np.savez(
+        destination,
+        schema=np.asarray("bonesseed-smpl-character-v2"),
+        root_p=np.zeros((4, 3), dtype=np.float32),
+        root_quat_wxyz=np.tile(
+            np.asarray((1, 0, 0, 0), dtype=np.float32), (4, 1)
+        ),
+        joints=np.zeros((4, 69), dtype=np.float32),
+        joint_vel=velocity,
+        fps=np.asarray(50, dtype=np.float32),
+    )
+    clip = bonesseed_smpl.load_dir(tmp_path)[0]
+    torch.testing.assert_close(clip.joint_vel, torch.from_numpy(velocity))
+    motion = MotionLib([clip], object(), "cpu", cache_body_state=False)
+    torch.testing.assert_close(motion.qd, torch.from_numpy(velocity))

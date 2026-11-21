@@ -26,6 +26,10 @@ class Clip(NamedTuple):
     # the source's own reference velocities, if it stores them (HDMI: not finite differences of the poses):
     # keypoint_names, keypoint_lin_vel / keypoint_ang_vel (T, b, 3), joint_vel (T, J), object_joint_vel (T, k) if articulated
     src_vel: dict | None = None
+    # Optional source-authoritative generalized velocity.  PHC's SMPL clips
+    # use local relative rotations for this quantity; a finite difference of
+    # their exponential-map coordinates is not equivalent near the pi branch.
+    joint_vel: torch.Tensor | None = None  # (T, J)
 
 
 def read_clip_list(path: str) -> list[str]:

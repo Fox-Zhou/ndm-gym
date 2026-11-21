@@ -357,16 +357,16 @@ class SMPLTrackingSim:
         self.scene.update(CONTROL_DT)
         next_state = self.state()
         next_frames = frames + 1
-        finite = torch.stack(
-            [value.flatten(1).isfinite().all(-1) for value in next_state]
-        ).all(0)
-        # Reward/FK and replay see a finite fallback for diverged worlds.  The
+        healthy = self.mdp.healthy_state(next_state)
+        # Reward/FK and replay see a safe fallback for diverged worlds.  The
+        # guard includes finite-but-exploded states because MuJoCo-Warp can
+        # return very large finite values for one step before NaN/Inf appears.
         # corresponding transition is still marked terminated below, reset in
         # this same control step, and contributes zero reward.
         safe_state = tuple(torch.nan_to_num(value) for value in state)
         safe_next_state = tuple(
             torch.where(
-                finite.view((-1,) + (1,) * (value.ndim - 1)),
+                healthy.view((-1,) + (1,) * (value.ndim - 1)),
                 value,
                 fallback,
             )
@@ -375,9 +375,9 @@ class SMPLTrackingSim:
         reward, terms = self.mdp.reward(
             safe_next_state, next_frames, action, previous, terms=True
         )
-        reward = torch.where(finite & reward.isfinite(), reward, 0.0)
+        reward = torch.where(healthy & reward.isfinite(), reward, 0.0)
         terms = {
-            name: torch.where(finite & value.isfinite(), value, 0.0)
+            name: torch.where(healthy & value.isfinite(), value, 0.0)
             for name, value in terms.items()
         }
         terminated = self.mdp.termination(next_state, next_frames)
