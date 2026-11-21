@@ -598,7 +598,18 @@ def main():
             if args.resume:
                 probe.load_state_dict(resume_ck)
         if algo.residual:
-            assert torch.equal(env.alpha, algo.alpha), (env.alpha, algo.alpha)
+            # G1 exposes its normalized motor scale on the simulator.  Generic
+            # articulations such as SMPL consume joint targets directly and
+            # therefore own the residual scale on the task MDP instead.
+            residual_scale = getattr(env, "alpha", getattr(mdp, "action_scale", None))
+            if residual_scale is None:
+                raise RuntimeError(
+                    "residual actions need a simulator or task action scale"
+                )
+            assert torch.equal(residual_scale, algo.alpha), (
+                residual_scale,
+                algo.alpha,
+            )
         buffer = ReplayBuffer(
             args.buffer_steps,
             args.num_envs,
