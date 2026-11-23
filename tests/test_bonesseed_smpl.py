@@ -100,7 +100,22 @@ def test_obsolete_euler_schema_is_rejected(tmp_path):
         bonesseed_smpl.load_dir(tmp_path)
 
 
-def test_v2_loads_source_authoritative_joint_velocity(tmp_path):
+def test_obsolete_v2_coordinate_schema_is_rejected(tmp_path):
+    _write_motion(tmp_path, "old_coordinates")
+    path = tmp_path / "old_coordinates" / "motion.npz"
+    with np.load(path) as data:
+        arrays = {name: data[name] for name in data.files}
+    np.savez(
+        path,
+        schema=np.asarray("bonesseed-smpl-character-v2"),
+        joint_vel=np.zeros((3, 69), dtype=np.float32),
+        **arrays,
+    )
+    with pytest.raises(ValueError, match="obsolete v2 motion"):
+        bonesseed_smpl.load_dir(tmp_path)
+
+
+def test_v3_loads_source_authoritative_joint_velocity(tmp_path):
     from ndm_gym.motion.library import MotionLib
 
     destination = tmp_path / "new" / "motion.npz"
@@ -108,7 +123,7 @@ def test_v2_loads_source_authoritative_joint_velocity(tmp_path):
     velocity = np.arange(4 * 69, dtype=np.float32).reshape(4, 69) / 100
     np.savez(
         destination,
-        schema=np.asarray("bonesseed-smpl-character-v2"),
+        schema=np.asarray("bonesseed-smpl-character-v3"),
         root_p=np.zeros((4, 3), dtype=np.float32),
         root_quat_wxyz=np.tile(
             np.asarray((1, 0, 0, 0), dtype=np.float32), (4, 1)

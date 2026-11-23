@@ -103,7 +103,13 @@ def load_dir(
                     f"{file}: obsolete v1 XYZ-Euler motion; reconvert it with "
                     "convert_bonesseed_umrpp_to_smpl.py"
                 )
-            if schema not in (None, "bonesseed-smpl-character-v2"):
+            if schema == "bonesseed-smpl-character-v2":
+                raise ValueError(
+                    f"{file}: obsolete v2 motion retained the native SMPL base "
+                    "rotation for an already-upright PHC character; reconvert it "
+                    "with convert_bonesseed_umrpp_to_smpl.py"
+                )
+            if schema not in (None, "bonesseed-smpl-character-v3"):
                 raise ValueError(f"{file}: unsupported schema {schema!r}")
             root_p = torch.from_numpy(np.asarray(data["root_p"], dtype=np.float32).copy())
             root_quat = torch.from_numpy(
@@ -124,7 +130,7 @@ def load_dir(
             raise ValueError(f"{file}: root_quat_wxyz must be [T,4]")
         if joints.shape != (root_p.shape[0], 69):
             raise ValueError(f"{file}: joints must be [T,69]")
-        if schema == "bonesseed-smpl-character-v2":
+        if schema == "bonesseed-smpl-character-v3":
             if joint_vel is None or joint_vel.shape != joints.shape:
                 raise ValueError(f"{file}: v2 joint_vel must match joints")
             if abs(fps - 50.0) > 1e-6:

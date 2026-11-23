@@ -10,6 +10,21 @@ from ndm_gym.tasks.articulation_tracking import ArticulationTrackingMDP
 from ndm_gym.worldmodels.articulation_increment import ArticulationIncrementWorldModel
 
 
+def test_smpl_viewer_history_uses_training_reset_padding_and_sliding_window():
+    from ndm_gym.smpl_viewer import _advance_history
+
+    first = torch.tensor([[1.0, 2.0]])
+    history = _advance_history(None, first, 3)
+    torch.testing.assert_close(history, first.unsqueeze(1).repeat(1, 3, 1))
+
+    second = torch.tensor([[3.0, 4.0]])
+    history = _advance_history(history, second, 3)
+    torch.testing.assert_close(
+        history,
+        torch.tensor([[[1.0, 2.0], [1.0, 2.0], [3.0, 4.0]]]),
+    )
+
+
 def test_smpl_policy_and_world_model_are_dimensionally_generic():
     spec = SMPL_CHARACTER_SPEC
     policy = TrackingPolicy(

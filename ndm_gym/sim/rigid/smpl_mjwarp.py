@@ -125,6 +125,7 @@ class SMPLTrackingSim:
         reset_noise=True,
         fail_reset=0.0,
         bin_fix=False,
+        eval_mode=False,
         usd_path=DEFAULT_USD_PATH,
     ):
         self.device = sim_cfg.device
@@ -171,7 +172,11 @@ class SMPLTrackingSim:
             raise ValueError("SMPL USD and MJCF expose different bodies")
         self.num_envs = self.N = int(num_envs)
         self.motion, self.mdp, self.gamma = motion, mdp, float(gamma)
-        self.max_episode_steps = int(max_episode_steps)
+        # Match the standard NDM TrackingSim contract: formal evaluation plays
+        # a complete clip, while training retains its configured episode cap.
+        self.max_episode_steps = (
+            int(max_episode_steps) if not eval_mode else 1_000_000_000
+        )
         self.reset_noise = bool(reset_noise)
         self.default_q = torch.zeros(
             SMPL_CHARACTER_SPEC.num_joints, device=self.device

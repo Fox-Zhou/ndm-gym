@@ -34,6 +34,7 @@ sim = [
 ]
 hand = ["mujoco==3.15.0", "mujoco-warp==3.15.0", "warp-lang==1.17.0"]
 render = ["pillow>=10", "matplotlib>=3.8"]  # tools/render*.py, plot.py, compare_videos.py (and ffmpeg)
+viewer = ["viser>=1.0,<2", "trimesh>=4"]  # live SMPL SuperMimic Viser viewer
 contacts = ["scipy>=1.11"]  # worldmodels/mjcf.py's contact inputs (fit_mjcf --contacts): the convex hulls of the robot's collision geoms
 docs = ["mkdocs>=1.6,<2", "mkdocs-material>=9.5", "mkdocstrings-python>=1.16"]
 test = ["pytest>=8", "pillow>=10", "pyyaml>=6", "scipy>=1.11"]
@@ -46,6 +47,7 @@ Issues = "https://github.com/Frank-ZY-Dou/ndm-gym/issues"
 [project.scripts]
 ndm-train = "ndm_gym.train:main"
 ndm-eval = "ndm_gym.evaluate:main"
+ndm-play-smpl = "ndm_gym.play_smpl:main"
 
 [tool.setuptools.dynamic]
 version = { attr = "ndm_gym.__version__" }
@@ -73,3 +75,4 @@ extend-exclude = ["third_party"]
 "ndm_gym/sim/rigid/hdmi_sim.py" = ["E402"]
 "ndm_gym/sim/rigid/hand_sim.py" = ["E402"]
 "ndm_gym/sim/rigid/quadrotor_sim.py" = ["E402"]
+"ndm_gym/sim/rigid/smpl_mjwarp.py" = ["E402"]
