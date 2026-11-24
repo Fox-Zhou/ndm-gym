@@ -23,6 +23,27 @@ parser.add_argument(
     ),
 )
 parser.add_argument(
+    "--smpl_mjcf",
+    default=(
+        "/ALG/zhouyangchen/human_template/character/ndm_smpl/ndm_smpl.xml"
+    ),
+)
+parser.add_argument(
+    "--motion_dir",
+    default=(
+        "/ALG/zhouyangchen/dataset/StableMotionTracking/BonesSEED/"
+        "ndm_gym_smplx_umr"
+    ),
+)
+parser.add_argument(
+    "--clips",
+    default=(
+        "/ALG/zhouyangchen/dataset/BonesSEED/supermimic/"
+        "bonesseed_smplx_umr_filtered.json"
+    ),
+)
+parser.add_argument("--motion_index", type=int, default=0)
+parser.add_argument(
     "--fall_seconds",
     type=float,
     default=4.0,
@@ -46,6 +67,8 @@ if args.fall_seconds <= 0:
     parser.error("--fall_seconds must be positive")
 if args.cycles < 0:
     parser.error("--cycles must be non-negative")
+if args.motion_index < 0:
+    parser.error("--motion_index must be non-negative")
 
 
 import torch
@@ -57,7 +80,16 @@ from isaaclab.scene import InteractiveSceneCfg
 from isaaclab.sim import SimulationContext
 from isaaclab.utils import configclass, instantiate, replace
 
-from ndm_gym.sim.rigid.smpl_mjwarp import CONTROL_DT, SMPL_CFG, make_sim
+from ndm_gym.core.rotations import mat_to_quat
+from ndm_gym.motion.library import MotionLib
+from ndm_gym.motion.sources import bonesseed_smpl
+from ndm_gym.robots.smpl_character import kinematics
+from ndm_gym.sim.rigid.smpl_mjwarp import (
+    CONTROL_DT,
+    FORMAL_SIM_JOINT_NAMES,
+    SMPL_CFG,
+    make_sim,
+)
 
 
 PASSIVE_SMPL_CFG = replace(
@@ -74,6 +106,15 @@ PASSIVE_SMPL_CFG = replace(
         )
     },
 )
+REFERENCE_SMPL_CFG = replace(
+    PASSIVE_SMPL_CFG,
+    spawn=replace(
+        PASSIVE_SMPL_CFG.spawn,
+        rigid_props=sim_utils.RigidBodyPropertiesCfg(
+            disable_gravity=True, linear_damping=0.0, angular_damping=0.0
+        ),
+    ),
+)
 
 
 @configclass
@@ -82,6 +123,9 @@ class FreeFallSceneCfg(InteractiveSceneCfg):
         prim_path="/World/ground", spawn=sim_utils.GroundPlaneCfg()
     )
     robot = replace(PASSIVE_SMPL_CFG, prim_path="{ENV_REGEX_NS}/Robot")
+    reference = replace(
+        REFERENCE_SMPL_CFG, prim_path="{ENV_REGEX_NS}/Reference"
+    )
 
 
 def reset_character(scene, sim) -> None:
@@ -89,6 +133,7 @@ def reset_character(scene, sim) -> None:
     env_ids = torch.arange(scene.num_envs, device=robot.device)
     pose = robot.data.default_root_state.torch[:, :7].clone()
     pose[:, :3] += scene.env_origins
+    pose[:, 0] -= 0.8
     velocity = torch.zeros(scene.num_envs, 6, device=robot.device)
     joint_position = torch.zeros_like(robot.data.joint_pos.torch)
     joint_velocity = torch.zeros_like(robot.data.joint_vel.torch)
@@ -107,9 +152,61 @@ def reset_character(scene, sim) -> None:
     scene.update(0.0)
 
 
+def write_reference(scene, motion, frame: int, initial_xy) -> None:
+    reference = scene["reference"]
+    env_ids = torch.arange(scene.num_envs, device=reference.device)
+    frames = torch.full(
+        (scene.num_envs,), frame, dtype=torch.long, device=reference.device
+    )
+    p, rotation, velocity, angular_velocity, q, qd = (
+        value.clone() for value in motion.ref_state(frames)
+    )
+    p[:, :2] -= initial_xy
+    p[:, 0] += 0.8
+    p += scene.env_origins
+    quat_wxyz = mat_to_quat(rotation)
+    pose = torch.cat((p, quat_wxyz[:, 1:4], quat_wxyz[:, :1]), -1)
+    sim_names = tuple(reference.joint_names)
+    formal_to_sim = torch.tensor(
+        [sim_names.index(name) for name in FORMAL_SIM_JOINT_NAMES],
+        dtype=torch.long,
+        device=reference.device,
+    )
+    sim_to_formal = torch.argsort(formal_to_sim)
+    reference.write_root_link_pose_to_sim_index(
+        root_pose=pose, env_ids=env_ids
+    )
+    reference.write_root_link_velocity_to_sim_index(
+        root_velocity=torch.cat((velocity, angular_velocity), -1),
+        env_ids=env_ids,
+    )
+    reference.write_joint_position_to_sim_index(
+        position=q[:, sim_to_formal], env_ids=env_ids
+    )
+    reference.write_joint_velocity_to_sim_index(
+        velocity=qd[:, sim_to_formal], env_ids=env_ids
+    )
+
+
 def main() -> None:
     sim_cfg = make_sim(args.device or "cuda:0")
     with launch_simulation(sim_cfg, args), torch.no_grad():
+        device = str(args.device or "cuda:0")
+        names = bonesseed_smpl.read_clip_list(args.clips)
+        if args.motion_index >= len(names):
+            raise IndexError(
+                f"motion index {args.motion_index} is outside [0, {len(names)})"
+            )
+        clips = bonesseed_smpl.load_dir(
+            args.motion_dir, names=[names[args.motion_index]]
+        )
+        motion = MotionLib(
+            clips,
+            kinematics(args.smpl_mjcf, device),
+            device,
+            cache_body_state=False,
+        )
+        initial_xy = motion.root_p[0, :2].clone()
         sim = SimulationContext(sim_cfg)
         scene = instantiate(
             FreeFallSceneCfg(
@@ -119,6 +216,7 @@ def main() -> None:
         sim.reset()
         robot = scene["robot"]
         print("native SMPL free-fall asset:", args.smpl_usd, flush=True)
+        print("reference motion:", motion.names[0], flush=True)
         print("joint names:", robot.joint_names, flush=True)
         print("body names:", robot.body_names, flush=True)
 
@@ -129,6 +227,10 @@ def main() -> None:
             root_start = float(robot.data.root_link_pos_w.torch[0, 2])
             for step in range(steps_per_fall):
                 wall_start = time.perf_counter()
+                reference_frame = step % int(motion.clip_len[0])
+                write_reference(
+                    scene, motion, reference_frame, initial_xy
+                )
                 scene.write_data_to_sim()
                 sim.step(render=True)
                 scene.update(CONTROL_DT)
