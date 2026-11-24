@@ -128,8 +128,8 @@ def add_train_args(parser: argparse.ArgumentParser):
     parser.add_argument("--motions", type=str, default="lafan1", choices=["lafan1", "interhuman", "bonesseed_smpl"],
                         help="the clips' source: LAFAN1's G1 CSVs, or two-person clips retargeted to two G1s "
                         "(tools/convert_interhuman.py)")  # fmt: skip
-    parser.add_argument("--smpl_mjcf", type=str, default="/ALG/zhouyangchen/human_template/character/phc_smpl/phc_smpl.xml")
-    parser.add_argument("--smpl_usd", type=str, default="/ALG/zhouyangchen/human_template/character/phc_smpl/phc_smpl.usda")
+    parser.add_argument("--smpl_mjcf", type=str, default="/ALG/zhouyangchen/human_template/character/ndm_smpl/ndm_smpl.xml")
+    parser.add_argument("--smpl_usd", type=str, default="/ALG/zhouyangchen/human_template/character/ndm_smpl/usd/ndm_smpl/ndm_smpl.usda")
     parser.add_argument("--max_clips", type=int, default=None,
                         help="optional SMPL data-loading limit for smoke tests")
     parser.add_argument("--reference_body_cache", action="store_true",

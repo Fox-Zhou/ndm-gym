@@ -29,12 +29,64 @@ from .reset_stats import bin_ema, mix_failures, previous_bins
 
 CONTROL_DT = 0.02
 DEFAULT_USD_PATH = (
-    "/ALG/zhouyangchen/human_template/character/phc_smpl/phc_smpl.usda"
+    "/ALG/zhouyangchen/human_template/character/ndm_smpl/usd/ndm_smpl/ndm_smpl.usda"
 )
 SMPL_USD_PATH = os.environ.get("SMPL_CHARACTER_USD", DEFAULT_USD_PATH)
 FORMAL_SIM_JOINT_NAMES = tuple(
-    f"{body}:{axis}" for body in SMPL_BODY_NAMES[1:] for axis in range(3)
+    f"{body}_x:{axis}" for body in SMPL_BODY_NAMES[1:] for axis in range(3)
 )
+
+
+def _smpl_actuators() -> dict[str, ImplicitActuatorCfg]:
+    """Reproduce the authoritative MJCF's passive joint gains.
+
+    IsaacLab's official MJCF-to-USD importer preserves the geometry, inertias,
+    limits and armatures, but does not translate MuJoCo's joint stiffness and
+    damping into IsaacLab actuator gains.  Keep those values explicit at the
+    simulator boundary instead of editing the generated USD.
+    """
+
+    groups = {
+        "legs": (
+            ("L_Hip", "L_Knee", "L_Ankle", "R_Hip", "R_Knee", "R_Ankle"),
+            800.0,
+            80.0,
+        ),
+        "toes_and_upper_limbs": (
+            (
+                "L_Toe",
+                "R_Toe",
+                "Neck",
+                "Head",
+                "L_Thorax",
+                "L_Shoulder",
+                "L_Elbow",
+                "R_Thorax",
+                "R_Shoulder",
+                "R_Elbow",
+            ),
+            500.0,
+            50.0,
+        ),
+        "trunk": (("Torso", "Spine", "Chest"), 1000.0, 100.0),
+        "wrists_and_hands": (
+            ("L_Wrist", "L_Hand", "R_Wrist", "R_Hand"),
+            300.0,
+            30.0,
+        ),
+    }
+    actuators = {}
+    for name, (bodies, stiffness, damping) in groups.items():
+        joints = [rf"^{body}_x:[0-2]$" for body in bodies]
+        actuators[name] = ImplicitActuatorCfg(
+            joint_names_expr=joints,
+            stiffness=stiffness,
+            damping=damping,
+            armature=0.02,
+            effort_limit_sim=None,
+            velocity_limit_sim=None,
+        )
+    return actuators
 
 
 SMPL_CFG = ArticulationCfg(
@@ -52,18 +104,7 @@ SMPL_CFG = ArticulationCfg(
         pos=(0.0, 0.0, 1.0), joint_pos={".*": 0.0}, joint_vel={".*": 0.0}
     ),
     soft_joint_pos_limit_factor=0.9,
-    # None keeps the authoritative gains, damping, armature and limits stored
-    # in the PHC USD while exposing all DoFs to IsaacLab's target API.
-    actuators={
-        "smpl": ImplicitActuatorCfg(
-            joint_names_expr=[".*"],
-            stiffness=None,
-            damping=None,
-            armature=None,
-            effort_limit_sim=None,
-            velocity_limit_sim=None,
-        )
-    },
+    actuators=_smpl_actuators(),
 )
 
 
@@ -159,9 +200,9 @@ class SMPLTrackingSim:
         sim_names = tuple(self.robot.joint_names)
         if set(sim_names) != set(FORMAL_SIM_JOINT_NAMES):
             raise ValueError("SMPL USD and MJCF expose different DoF names")
-        # PHC's legacy USD places Neck/Head after the left arm whereas the
-        # generated MJCF places them before both arms.  NDM tensors always use
-        # the MJCF order; only this simulator boundary reorders them.
+        # NDM tensors retain the authoritative MJCF's body and XYZ order.  The
+        # importer collapses each body's three hinge joints into one D6 joint
+        # named ``<body>_x`` with simulator axes 0, 1 and 2.
         self.formal_to_sim = torch.tensor(
             [sim_names.index(name) for name in FORMAL_SIM_JOINT_NAMES],
             dtype=torch.long,

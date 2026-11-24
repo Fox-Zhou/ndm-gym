@@ -14,7 +14,7 @@ from ndm_gym.robots.smpl_character import (
 ASSET = Path(
     os.environ.get(
         "SMPL_CHARACTER_MJCF",
-        "/ALG/zhouyangchen/human_template/character/phc_smpl/phc_smpl.xml",
+        "/ALG/zhouyangchen/human_template/character/ndm_smpl/ndm_smpl.xml",
     )
 )
 
