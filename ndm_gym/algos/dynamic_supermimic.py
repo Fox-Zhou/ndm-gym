@@ -35,7 +35,15 @@ class DynamicSuperMimicRollout(nn.Module):
     extrapolation.
     """
 
-    def __init__(self, policy, world_model, mdp, *, goal_frames: int = 10):
+    def __init__(
+        self,
+        policy,
+        world_model,
+        mdp,
+        *,
+        goal_frames: int = 10,
+        reference_residual: bool = False,
+    ):
         super().__init__()
         if goal_frames < 1:
             raise ValueError("goal_frames must be positive")
@@ -43,6 +51,25 @@ class DynamicSuperMimicRollout(nn.Module):
         self.world_model = freeze_module(world_model)
         self.mdp = mdp
         self.goal_frames = goal_frames
+        self.reference_residual = bool(reference_residual)
+
+    def _setpoint(self, policy_output: torch.Tensor, frames: torch.Tensor) -> torch.Tensor:
+        """Convert a policy output to the action stored in Stage-A replay.
+
+        A residual SuperMimic policy predicts offsets about the next reference
+        pose.  Stage-B references are generated dynamically, so that base must
+        be gathered from the differentiable reference on every imagined step;
+        it cannot be cached from the Stage-A training MotionLib.
+        """
+
+        action = policy_output
+        if self.reference_residual:
+            reference_q = self.mdp.reference.ref_state(frames + 1)[4]
+            action = action + (
+                reference_q - self.mdp.default_q
+            ) / self.mdp.action_scale
+        clamp = getattr(self.mdp, "clamp_action", None)
+        return clamp(action) if clamp is not None else action
 
     def forward(
         self,
@@ -63,7 +90,9 @@ class DynamicSuperMimicRollout(nn.Module):
         survivals = []
         for _ in range(horizon):
             goal = self.mdp.reference.goal(frames, self.goal_frames)
-            action = self.policy(observation_history, goal)
+            action = self._setpoint(
+                self.policy(observation_history, goal), frames
+            )
             state = self.world_model.step(state, action, context)
             frames = frames + 1
             reward, terms = self.mdp.reward(
